@@ -10,7 +10,7 @@ import os
 from PIL import Image, ImageDraw, ImageFont
 
 from ultralytics.data.utils import load_dataset_cache_file
-from ultralytics.engine.results import Results, Boxes
+from ultralytics.engine.results import Results
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
@@ -97,23 +97,35 @@ class DataEngine:
         assert name_list is None or isinstance(name_list,list), "name_list should be a list of strings or None"
 
         if name_list is not None :
-            self.model.set_classes(name_list, self.model.get_text_pe(name_list))
             print(f"Set {len(name_list)} classes")
+            self.model.set_classes(name_list, self.model.get_text_pe(name_list))
+
         else:
             print("No classes set")
 
 
 
     def yoloe_predict(self,indice,conf=0.05,save_path=None):
-        
         img_file=self.labels[indice]['im_file']
+        if hasattr(self,'img_source'):
+            img_file=os.path.join(self.img_source,img_file)
         result=self.model.predict(img_file,conf=conf)
 
         if save_path is not None:
             result[0].save(save_path)
             print("save to:", save_path)
         return result
-    
+
+    def yoloe_predict_batch(self, indices, conf=0.05):
+        img_files=[]
+        for indice in indices:
+            img_file=self.labels[indice]['im_file']
+            if hasattr(self,'img_source'):
+                img_file=os.path.join(self.img_source,img_file)
+            img_files.append(img_file)
+        if not img_files:
+            return []
+        return list(self.model.predict(img_files, conf=conf, batch=len(img_files)))
 
     def __len__(self):
         return len(self.labels)
@@ -155,7 +167,7 @@ class DataEngine:
                 raise FileNotFoundError(f"Text embed pt file not found: {text_embed_pt}")
             else:
                 print("Load text embed from:", text_embed_pt)
-            txt_map = torch.load(cache_path, map_location=self.device,weights_only=False)
+            txt_map = torch.load(text_embed_pt, map_location=self.device, weights_only=False)
             self.names=list(txt_map.keys())
             
     def save_cached_label(self,save_path=None):
@@ -192,15 +204,23 @@ class DataEngine:
                 print(f"  Value: {val}")
 
 
-    def detection_predict_and_update_labels(self,indice,iou=0.3,replace=True):
-        # im_file=self.labels[indice]['im_file']
-        result=self.yoloe_predict(indice=indice,conf=0.1)
+    def detection_predict_and_update_labels(self,indice,iou=0.3,replace=True,conf=0.1):
+        result=self.yoloe_predict(indice=indice,conf=conf)
+        if not result:
+            return
+        self._update_detection_label(indice,result[0],iou=iou,replace=replace)
 
-        assert self.data_style == "detection", "detection_predict_and_update_labels only works for detection data_style"
-        boxes=result[0].boxes
+    def detection_predict_and_update_labels_batch(self, indices, iou=0.3, replace=False, conf=0.1):
+        results=self.yoloe_predict_batch(indices, conf=conf)
+        assert len(results)==len(indices), "Mismatch between results and indices length"
+        for indice,res in zip(indices,results):
+            self._update_detection_label(indice,res,iou=iou,replace=replace)
+
+    def _update_detection_label(self, indice, result_obj, iou=0.3, replace=True):
+        assert self.data_style == "detection", "_update_detection_label requires detection data_style"
+        boxes=result_obj.boxes
         bboxes_xyxy=boxes.xyxy.cpu().numpy()
-        yolo_box=YoloBox(img_shape=result[0].orig_img.shape[:2]).load_from_xyxy(bboxes_xyxy)
-
+        yolo_box=YoloBox(img_shape=result_obj.orig_img.shape[:2]).load_from_xyxy(bboxes_xyxy)
         bboxes_xywhn=yolo_box.xywhn
         cls=boxes.cls.cpu().numpy()
         assert bboxes_xywhn.shape[0]==cls.shape[0], "Mismatch between number of boxes and classes"
@@ -208,52 +228,49 @@ class DataEngine:
             self.labels[indice]['bboxes']=bboxes_xywhn
             self.labels[indice]['cls']=cls
             print(f"Replace with {bboxes_xywhn.shape[0]} boxes")
-        else:
-            # compare the new boxes with existing boxes, and append only the new ones
-            # if iou less than threshold
-            keep_indices=[]
-            for i in range(bboxes_xywhn.shape[0]):
-                bbox=bboxes_xywhn[i]
-                c=cls[i]
-                max_iou=0
-                for j in range(self.labels[indice]['bboxes'].shape[0]):
-                    exist_bbox=self.labels[indice]['bboxes'][j]
-                    # compute iou
-                    box1=YoloBox(img_shape=result[0].orig_img.shape[:2]).load_from_xywhn_normalized(bbox).xyxy[0]
-                    box2=YoloBox(img_shape=result[0].orig_img.shape[:2]).load_from_xywhn_normalized(exist_bbox).xyxy[0]
-                    # box: x0,y0,x1,y1
-                    xi1 = max(box1[0], box2[0])
-                    yi1 = max(box1[1], box2[1])
-                    xi2 = min(box1[2], box2[2])
-                    yi2 = min(box1[3], box2[3])
-                    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-                    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-                    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-                    union_area = box1_area + box2_area - inter_area
-                    iou = inter_area / union_area if union_area > 0 else 0
-                    if iou>max_iou:
-                        max_iou=iou
-                if max_iou<iou:
-                    keep_indices.append(i)
-            print(f"Append {len(keep_indices)} new boxes out of {bboxes_xywhn.shape[0]}")   
+            return
+        keep_indices=[]
+        for i in range(bboxes_xywhn.shape[0]):
+            bbox=bboxes_xywhn[i]
+            max_iou=0
+            for j in range(self.labels[indice]['bboxes'].shape[0]):
+                exist_bbox=self.labels[indice]['bboxes'][j]
+                box1=YoloBox(img_shape=result_obj.orig_img.shape[:2]).load_from_xywhn_normalized(bbox[np.newaxis,:]).xyxy[0]
+                box2=YoloBox(img_shape=result_obj.orig_img.shape[:2]).load_from_xywhn_normalized(exist_bbox[np.newaxis,:]).xyxy[0]
+                xi1=max(box1[0],box2[0])
+                yi1=max(box1[1],box2[1])
+                xi2=min(box1[2],box2[2])
+                yi2=min(box1[3],box2[3])
+                inter_area=max(0,xi2-xi1)*max(0,yi2-yi1)
+                box1_area=(box1[2]-box1[0])*(box1[3]-box1[1])
+                box2_area=(box2[2]-box2[0])*(box2[3]-box2[1])
+                union_area=box1_area+box2_area-inter_area
+                current_iou=inter_area/union_area if union_area>0 else 0
+                if current_iou>max_iou:
+                    max_iou=current_iou
+            if max_iou<iou:
+                keep_indices.append(i)
+        print(f"Append {len(keep_indices)} new boxes out of {bboxes_xywhn.shape[0]}")
+        for i in keep_indices:
+            bbox=bboxes_xywhn[i]
+            c=cls[i]
+            self.labels[indice]['bboxes']=np.vstack([self.labels[indice]['bboxes'],bbox])
+            self.labels[indice]['cls']=np.vstack([self.labels[indice]['cls'],c])
 
-            for i in keep_indices:
-                bbox=bboxes_xywhn[i]
-                c=cls[i]
-                self.labels[indice]['bboxes']=np.vstack([self.labels[indice]['bboxes'],bbox])
-                self.labels[indice]['cls']=np.hstack([self.labels[indice]['cls'],c])
-
-    def grounding_predict_and_update_labels(self,indice,iou=0.05,replace=True):
+    def grounding_predict_and_update_labels_batch(self,indices,iou=0.05,replace=False,conf=0.1):
 
 
-        im_file=self.labels[indice]['im_file']
+        results=self.yoloe_predict_batch(indices, conf=conf)
+        assert len(results)==len(indices), "Mismatch between results and indices length"
+        for indice,res in zip(indices,results):
+            self._update_grounding_label(indice,res,iou=iou,replace=replace)
 
 
-        result=self.yoloe_predict(im_file,conf=0.1)
-        assert self.data_style == "grounding", "grounding_predict_and_update_labels only works for grounding data_style"
-        boxes=result[0].boxes
+    def _update_grounding_label(self, indice, result_obj, iou=0.05, replace=True):
+        assert self.data_style == "grounding", "_update_grounding_label requires grounding data_style"
+        boxes=result_obj.boxes
         bboxes_xyxy=boxes.xyxy.cpu().numpy()
-        yolo_box=YoloBox(img_shape=result[0].orig_img.shape[:2]).load_from_xyxy(bboxes_xyxy)
+        yolo_box=YoloBox(img_shape=result_obj.orig_img.shape[:2]).load_from_xyxy(bboxes_xyxy)
         bboxes_xywhn=yolo_box.xywhn
         cls=boxes.cls.cpu().numpy()      
 
@@ -263,7 +280,34 @@ class DataEngine:
             self.labels[indice]['bboxes']=bboxes_xywhn
             self.labels[indice]['cls']=cls
             print(f"Replace with {bboxes_xywhn.shape[0]} boxes")  
-
+            return
+        keep_indices=[]
+        for i in range(bboxes_xywhn.shape[0]):
+            bbox=bboxes_xywhn[i]
+            max_iou=0
+            for j in range(self.labels[indice]['bboxes'].shape[0]):
+                exist_bbox=self.labels[indice]['bboxes'][j]
+                box1=YoloBox(img_shape=result_obj.orig_img.shape[:2]).load_from_xywhn_normalized(bbox[np.newaxis,:]).xyxy[0]
+                box2=YoloBox(img_shape=result_obj.orig_img.shape[:2]).load_from_xywhn_normalized(exist_bbox[np.newaxis,:]).xyxy[0]
+                xi1=max(box1[0],box2[0])
+                yi1=max(box1[1],box2[1])
+                xi2=min(box1[2],box2[2])
+                yi2=min(box1[3],box2[3])
+                inter_area=max(0,xi2-xi1)*max(0,yi2-yi1)
+                box1_area=(box1[2]-box1[0])*(box1[3]-box1[1])
+                box2_area=(box2[2]-box2[0])*(box2[3]-box2[1])
+                union_area=box1_area+box2_area-inter_area
+                current_iou=inter_area/union_area if union_area>0 else 0
+                if current_iou>max_iou:
+                    max_iou=current_iou
+            if max_iou<iou:
+                keep_indices.append(i)
+        print(f"Append {len(keep_indices)} new boxes out of {bboxes_xywhn.shape[0]}")
+        for i in keep_indices:
+            bbox=bboxes_xywhn[i]
+            c=cls[i]
+            self.labels[indice]['bboxes']=np.vstack([self.labels[indice]['bboxes'],bbox])
+            self.labels[indice]['cls']=np.vstack([self.labels[indice]['cls'],c])
 
 
 
@@ -280,7 +324,7 @@ class DataEngine:
         """Visualizes a label using ultralytics.engine.results.Results and saves it."""
         
         assert self.data_style in ["grounding","detection"]
-        
+        print("Visualizing index:", indice)
         if self.data_style=="detection":
             assert self.yaml_config is not None, "yaml_config must be provided for detection data_style"
 
@@ -299,39 +343,61 @@ class DataEngine:
         
         bboxes_xywhn = label['bboxes']
         cls = label['cls']
-        if self.data_style=="detection":
-            # transfer cls to texts
-            texts = [str(int(c.item())) for c in cls]
-            names=self.names
+        names = self.names
+
+        if isinstance(names, (list, tuple)):
+            names = {int(i): str(n) for i, n in enumerate(names)}
+        elif isinstance(names, dict):
+            names = {int(k): str(v) for k, v in names.items()}
         else:
-            texts = label['texts']
-            assert isinstance(texts, list), "Expected texts to be a list"
-            names = {i: (t[0] if isinstance(t, list) else t) for i, t in enumerate(texts)}
-        # Convert from normalized [x_center, y_center, w, h] to [x0, y0, x1, y1]
-        bboxes_xyxy = YoloBox(img_shape=(img_h, img_w)).load_from_xywhn_normalized(bboxes_xywhn).xyxy
+            raise TypeError(f"Unsupported type for names: {type(names)}")
 
-        plot_cls = cls
+        yolo_box = YoloBox(img_shape=(img_h, img_w)).load_from_xywhn_normalized(bboxes_xywhn)
+        bboxes_xyxy = yolo_box.xyxy.astype(np.float32)
 
-        # Create Boxes object
-        # We need to add confidence and class to each bbox.
-        # Format for Boxes is [x, y, w, h, conf, cls]
-        # Using dummy confidence of 1.0
-        conf = np.ones((bboxes_xywhn.shape[0], 1))
-        
-        # Ensure plot_cls is a column vector (N, 1)
-        if plot_cls.ndim == 1:
-            plot_cls = plot_cls[:, np.newaxis]
+        print("Number of boxes to visualize:", bboxes_xywhn.shape[0])
+        num_boxes = bboxes_xyxy.shape[0]
 
-        boxes_data = np.hstack([bboxes_xyxy, conf, plot_cls])
-        
+        cls_array = np.asarray(cls)
+        if cls_array.ndim == 0:
+            cls_array = cls_array.reshape(1)
+        cls_array = cls_array.reshape(-1)
+
+        if cls_array.dtype == object:
+            processed_cls = []
+            for item in cls_array:
+                if isinstance(item, (list, tuple, np.ndarray)):
+                    flat_item = np.asarray(item).flatten()
+                    processed_cls.append(float(flat_item[0]) if flat_item.size else 0.0)
+                else:
+                    processed_cls.append(float(item))
+            cls_array = np.array(processed_cls, dtype=np.float32)
+        else:
+            cls_array = cls_array.astype(np.float32)
+
+        if cls_array.shape[0] != num_boxes:
+            raise ValueError(f"Mismatch between boxes ({num_boxes}) and class labels ({cls_array.shape[0]})")
+
+        conf = np.ones((num_boxes, 1), dtype=np.float32)
+        plot_cls = cls_array.reshape(num_boxes, 1)
+
+        if num_boxes == 0:
+            boxes_tensor = torch.empty((0, 6), dtype=torch.float32)
+        else:
+            boxes_array = np.hstack([bboxes_xyxy, conf, plot_cls]).astype(np.float32)
+            boxes_tensor = torch.from_numpy(boxes_array)
+
+        print("Boxes data shape:", boxes_tensor.shape)
+
         # Create Results object
         result = Results(
             orig_img=orig_img,
             path=im_file,
             names=names,
-            boxes=boxes_data
+            boxes=boxes_tensor
         )
         
+        print("Number of boxes in Results object:", len(result.boxes) if result.boxes is not None else 0)
         if result.boxes:
             result.boxes.is_track = False # Set to false to avoid printing track_ids
 
@@ -340,51 +406,109 @@ class DataEngine:
 
         # im_array = result.plot(conf=False) # conf=False to not show confidence scores
         
-        # # Save the visualized image
-        # Image.fromarray(im_array[..., ::-1]).save(save_path)  # BGR to RGB for PIL
+        # # Save the visualized image""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
         print(f"Saved visualization to {save_path}")
 
 
-de=DataEngine()
-
-
-yaml_config="/root/ultra_louis_work/datasets/Objects365v1.yaml"
-
-cache_path="/root/ultra_louis_work/datasets/Objects365v1/labels/train.cache"
-de.load_cached_label(cache_path=cache_path, data_style="detection", yaml_config=yaml_config)
-de.load_yoloe()
-
-de.set_classes(yaml_config=yaml_config)
-
-# de=DataEngine()
-# cache_path="/root/ultra_louis_work/datasets/mixed_grounding/annotations/final_mixed_train_no_coco_segm.merged.cache"
-# text_embed_pt="/root/ultra_louis_work/datasets/mixed_grounding/gqa/text_embeddings_mobileclip_blt.pt"
-# de.load_cached_label(cache_path=cache_path, 
-#                      data_style="grounding", 
-#                      text_embed_pt=text_embed_pt)
-# de.load_yoloe()
-
-# de.set_classes(yaml_config=None,  text_embed_pt=text_embed_pt)
 
 from tqdm import tqdm
 
-for indice in tqdm(range(len(de))):
 
-    # de.visual_and_save2(indice,
-    #                     save_path=f"./visualize_before_{indice}.jpg")
-    de.detection_predict_and_update_labels(indice,iou=0.1)
-de.save_cached_label(save_path=cache_path.replace(".cache", "_updated.cache"))
+DATA_NAME="Objects365v1" #
+
+if DATA_NAME=="Objects365v1":
+    de=DataEngine(device="cuda")
+    yaml_config="/root/ultra_louis_work/datasets/Objects365v1.yaml"
+    cache_path="/root/ultra_louis_work/datasets/Objects365v1/labels/train.cache"
+    de.load_cached_label(cache_path=cache_path, data_style="detection", yaml_config=yaml_config)
+    de.load_yoloe()
+    de.set_classes(yaml_config=yaml_config) # set classes for the dataset
+
+    batch_size=64
+    for start in tqdm(range(0,len(de),batch_size)):
+        batch_indices=list(range(start,min(start+batch_size,len(de))))
+        de.detection_predict_and_update_labels_batch(batch_indices,iou=0.1,conf=0.1)
+    de.save_cached_label(save_path=cache_path.replace(".cache", "_updated.cache"))
+
+elif DATA_NAME=="mixed_grounding":
 
 
+    # set gpu 3 
+    device="cuda:1"
+    de=DataEngine(device=device)
+    cache_path="/root/ultra_louis_work/datasets/mixed_grounding/annotations/final_mixed_train_no_coco_segm.merged.cache"
+    text_embed_pt="/root/ultra_louis_work/datasets/mixed_grounding/gqa/text_embeddings_mobileclip_blt.pt"
+    de.load_cached_label(cache_path=cache_path, 
+                        data_style="grounding", 
+                        text_embed_pt=text_embed_pt)
+    de.load_yoloe()
 
-# de.load_yoloe(yaml_config="/root/ultra_louis_work/datasets/Objects365v1.yaml")
+    batch_size=32
+    for start in tqdm(range(1000,len(de),batch_size)):
+        batch_indices=list(range(start,min(start+batch_size,len(de))))
+        batch_texts=[]
+        for indice in batch_indices:
+            label_texts = de.labels[indice].get("texts", [])
+            if isinstance(label_texts, list):
+                for entry in label_texts:
+                    if isinstance(entry, (list, tuple)):
+                        batch_texts.extend(str(t) for t in entry)
+                    else:
+                        batch_texts.append(str(entry))
+
+        if batch_texts:
+            unique_texts = list(dict.fromkeys(batch_texts))
+            de.set_classes(name_list=unique_texts)
+        else:
+            de.set_classes(name_list=None)                      
+
+        # debug_indice = batch_indices[10]
+        # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example.jpg")
+        try:
+            de.grounding_predict_and_update_labels_batch(batch_indices, iou=0.1, conf=0.1)
+        except Exception as e:
+            print(f"Error processing batch starting at index {start}: {e}")
+        # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example1.jpg")
 
 
+    de.save_cached_label(save_path=cache_path.replace(".cache", "_updated.cache"))
 
-# de.visual_and_save2(1000,data_style="detection",
-#                     yaml_config="/root/ultra_louis_work/datasets/Objects365v1.yaml")
-
-# de.yoloe_predict(1000,conf=0.25,save_path="./yoloe_pred.jpg")
+elif DATA_NAME=="flickr":
 
 
-# de.print_one_label(1000)
+    # set gpu 2
+    device="cuda:2"
+    de=DataEngine(device=device)
+    cache_path="/root/ultra_louis_work/datasets/flickr/annotations/final_flickr_separateGT_train_segm.merged.cache"
+    text_embed_pt="/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
+    de.load_cached_label(cache_path=cache_path, 
+                        data_style="grounding", 
+                        text_embed_pt=text_embed_pt)
+    de.load_yoloe()
+
+    batch_size=128
+    for start in tqdm(range(1000,len(de),batch_size)):
+        batch_indices=list(range(start,min(start+batch_size,len(de))))
+        batch_texts=[]
+        for indice in batch_indices:
+            label_texts = de.labels[indice].get("texts", [])
+            if isinstance(label_texts, list):
+                for entry in label_texts:
+                    if isinstance(entry, (list, tuple)):
+                        batch_texts.extend(str(t) for t in entry)
+                    else:
+                        batch_texts.append(str(entry))
+
+        if batch_texts:
+            unique_texts = list(dict.fromkeys(batch_texts))
+            de.set_classes(name_list=unique_texts)
+        else:
+            de.set_classes(name_list=None)
+
+        # debug_indice = batch_indices[10]
+        # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example.jpg")
+        de.grounding_predict_and_update_labels_batch(batch_indices, iou=0.1, conf=0.1)
+        # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example1.jpg")
+
+
+    de.save_cached_label(save_path=cache_path.replace(".cache", "_updated.cache"))
