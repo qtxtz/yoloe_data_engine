@@ -99,6 +99,7 @@ class DataEngine:
         if name_list is not None :
             print(f"Set {len(name_list)} classes")
             self.model.set_classes(name_list, self.model.get_text_pe(name_list))
+            self.names=name_list
 
         else:
             print("No classes set")
@@ -302,13 +303,46 @@ class DataEngine:
                     max_iou=current_iou
             if max_iou<iou:
                 keep_indices.append(i)
-        print(f"Append {len(keep_indices)} new boxes out of {bboxes_xywhn.shape[0]}")
+
+        # get  current texts
+        current_texts= self.labels[indice]['texts']
+        current_texts= [ text[0] for text in current_texts] # remote the list structure inside
+
+
+        #  get all bbox that should be appended from result_obj  with their cls and texts
+        append_bboxes,append_cls,append_text = [],[],[]
         for i in keep_indices:
-            bbox=bboxes_xywhn[i]
-            c=cls[i]
+            append_bboxes.append(bboxes_xywhn[i])
+            append_cls.append(cls[i])
+            append_text.append(self.names[int(cls[i])])
+
+
+
+        # update the current texts
+        for text in append_text:
+            if text not in current_texts:
+                current_texts.append(text)
+
+        # update the append_cls to match the updated texts
+        updated_append_cls=[]
+        for text in append_text:
+            updated_cls=current_texts.index(text) #
+            updated_append_cls.append(updated_cls)
+        append_cls=updated_append_cls
+
+        # format
+        append_bboxes= np.array(append_bboxes).reshape(-1,4)
+        append_cls= np.array(append_cls).reshape(-1,1)
+
+
+        # append the boxes and cls
+        for i in range(append_bboxes.shape[0]):
+            bbox=append_bboxes[i]
+            c=append_cls[i]
             self.labels[indice]['bboxes']=np.vstack([self.labels[indice]['bboxes'],bbox])
             self.labels[indice]['cls']=np.vstack([self.labels[indice]['cls'],c])
-
+        # print how many boxes are appended
+        print(f"Append {append_bboxes.shape[0]} new boxes out of {bboxes_xywhn.shape[0]}")
 
 
 
@@ -414,7 +448,7 @@ class DataEngine:
 from tqdm import tqdm
 
 
-DATA_NAME="Objects365v1" #
+DATA_NAME="mixed_grounding" #
 
 if DATA_NAME=="Objects365v1":
     de=DataEngine(device="cuda")
@@ -471,7 +505,7 @@ elif DATA_NAME=="mixed_grounding":
         # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example1.jpg")
 
 
-    de.save_cached_label(save_path=cache_path.replace(".cache", "_updated.cache"))
+    de.save_cached_label(save_path=cache_path.replace(".cache", ".updated.cache"))
 
 elif DATA_NAME=="flickr":
 
@@ -511,4 +545,4 @@ elif DATA_NAME=="flickr":
         # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example1.jpg")
 
 
-    de.save_cached_label(save_path=cache_path.replace(".cache", "_updated.cache"))
+    de.save_cached_label(save_path=cache_path.replace(".cache", ".updated.cache"))
