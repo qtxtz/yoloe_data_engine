@@ -170,7 +170,24 @@ class DataEngine:
                 print("Load text embed from:", text_embed_pt)
             txt_map = torch.load(text_embed_pt, map_location=self.device, weights_only=False)
             self.names=list(txt_map.keys())
-            
+
+
+    def print_data_info(self):
+        """
+        Print information about the dataset labels:
+        - data_style
+        - Total number of labels
+        - Total number of boxes (for detection and grounding)
+        """
+        print(f"Data style: {self.data_style}")
+        print(f"Total number of labels: {len(self.labels)}")
+        if self.data_style in ["detection", "grounding"]:
+            total_boxes = sum(len(label.get("bboxes", [])) for label in self.labels)
+            print(f"Total number of boxes: {total_boxes}")
+
+
+
+
     def save_cached_label(self,save_path=None):
         if save_path is None:
             save_path=self.cache_path
@@ -359,8 +376,6 @@ class DataEngine:
         
         assert self.data_style in ["grounding","detection"]
         print("Visualizing index:", indice)
-        if self.data_style=="detection":
-            assert self.yaml_config is not None, "yaml_config must be provided for detection data_style"
 
 
         
@@ -377,7 +392,13 @@ class DataEngine:
         
         bboxes_xywhn = label['bboxes']
         cls = label['cls']
-        names = self.names
+        if self.data_style=="detection":
+            assert self.yaml_config is not None, "yaml_config must be provided for detection data_style"
+            names = self.names
+        
+        elif self.data_style=="grounding":
+            names=label.get('texts',None)
+            names= [ text[0] for text in names] # remote the list structure inside
 
         if isinstance(names, (list, tuple)):
             names = {int(i): str(n) for i, n in enumerate(names)}
@@ -425,17 +446,25 @@ class DataEngine:
 
         # Create Results object
         result = Results(
-            orig_img=orig_img,
+            orig_img=np.array(orig_img),
             path=im_file,
             names=names,
             boxes=boxes_tensor
         )
+        # print each bbox witth cls and name from the result object
+        for i in range(result.boxes.shape[0]):
+            box = result.boxes[i]
+            cls_id = int(box.cls.item())
+            cls_name = result.names.get(cls_id, "unknown")
+            print(f"Box {i}: Class ID = {cls_id}, Class Name = {cls_name}, Box Coordinates = {box.xyxy.tolist()}")
         
         print("Number of boxes in Results object:", len(result.boxes) if result.boxes is not None else 0)
         if result.boxes:
             result.boxes.is_track = False # Set to false to avoid printing track_ids
 
         result.save(save_path)
+
+        
         # # Plot the results
 
         # im_array = result.plot(conf=False) # conf=False to not show confidence scores
@@ -448,101 +477,103 @@ class DataEngine:
 from tqdm import tqdm
 
 
-DATA_NAME="mixed_grounding" #
+if __name__=="__main__":
+        
+    DATA_NAME="mixed_grounding" #
 
-if DATA_NAME=="Objects365v1":
-    de=DataEngine(device="cuda")
-    yaml_config="/root/ultra_louis_work/datasets/Objects365v1.yaml"
-    cache_path="/root/ultra_louis_work/datasets/Objects365v1/labels/train.cache"
-    de.load_cached_label(cache_path=cache_path, data_style="detection", yaml_config=yaml_config)
-    de.load_yoloe()
-    de.set_classes(yaml_config=yaml_config) # set classes for the dataset
+    if DATA_NAME=="Objects365v1":
+        de=DataEngine(device="cuda")
+        yaml_config="/root/ultra_louis_work/datasets/Objects365v1.yaml"
+        cache_path="/root/ultra_louis_work/datasets/Objects365v1/labels/train.cache"
+        de.load_cached_label(cache_path=cache_path, data_style="detection", yaml_config=yaml_config)
+        de.load_yoloe()
+        de.set_classes(yaml_config=yaml_config) # set classes for the dataset
 
-    batch_size=64
-    for start in tqdm(range(0,len(de),batch_size)):
-        batch_indices=list(range(start,min(start+batch_size,len(de))))
-        de.detection_predict_and_update_labels_batch(batch_indices,iou=0.1,conf=0.1)
-    de.save_cached_label(save_path=cache_path.replace(".cache", "_updated.cache"))
+        batch_size=64
+        for start in tqdm(range(0,len(de),batch_size)):
+            batch_indices=list(range(start,min(start+batch_size,len(de))))
+            de.detection_predict_and_update_labels_batch(batch_indices,iou=0.1,conf=0.1)
+        de.save_cached_label(save_path=cache_path.replace(".cache", "_updated.cache"))
 
-elif DATA_NAME=="mixed_grounding":
+    elif DATA_NAME=="mixed_grounding":
 
 
-    # set gpu 3 
-    device="cuda:1"
-    de=DataEngine(device=device)
-    cache_path="/root/ultra_louis_work/datasets/mixed_grounding/annotations/final_mixed_train_no_coco_segm.merged.cache"
-    text_embed_pt="/root/ultra_louis_work/datasets/mixed_grounding/gqa/text_embeddings_mobileclip_blt.pt"
-    de.load_cached_label(cache_path=cache_path, 
-                        data_style="grounding", 
-                        text_embed_pt=text_embed_pt)
-    de.load_yoloe()
+        # set gpu 3 
+        device="cuda:1"
+        de=DataEngine(device=device)
+        cache_path="/root/ultra_louis_work/datasets/mixed_grounding/annotations/final_mixed_train_no_coco_segm.merged.cache"
+        text_embed_pt="/root/ultra_louis_work/datasets/mixed_grounding/gqa/text_embeddings_mobileclip_blt.pt"
+        de.load_cached_label(cache_path=cache_path, 
+                            data_style="grounding", 
+                            text_embed_pt=text_embed_pt)
+        de.load_yoloe()
 
-    batch_size=32
-    for start in tqdm(range(1000,len(de),batch_size)):
-        batch_indices=list(range(start,min(start+batch_size,len(de))))
-        batch_texts=[]
-        for indice in batch_indices:
-            label_texts = de.labels[indice].get("texts", [])
-            if isinstance(label_texts, list):
-                for entry in label_texts:
-                    if isinstance(entry, (list, tuple)):
-                        batch_texts.extend(str(t) for t in entry)
-                    else:
-                        batch_texts.append(str(entry))
+        batch_size=32
+        for start in tqdm(range(1000,len(de),batch_size)):
+            batch_indices=list(range(start,min(start+batch_size,len(de))))
+            batch_texts=[]
+            for indice in batch_indices:
+                label_texts = de.labels[indice].get("texts", [])
+                if isinstance(label_texts, list):
+                    for entry in label_texts:
+                        if isinstance(entry, (list, tuple)):
+                            batch_texts.extend(str(t) for t in entry)
+                        else:
+                            batch_texts.append(str(entry))
 
-        if batch_texts:
-            unique_texts = list(dict.fromkeys(batch_texts))
-            de.set_classes(name_list=unique_texts)
-        else:
-            de.set_classes(name_list=None)                      
+            if batch_texts:
+                unique_texts = list(dict.fromkeys(batch_texts))
+                de.set_classes(name_list=unique_texts)
+            else:
+                de.set_classes(name_list=None)                      
 
-        # debug_indice = batch_indices[10]
-        # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example.jpg")
-        try:
+            # debug_indice = batch_indices[10]
+            # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example.jpg")
+            try:
+                de.grounding_predict_and_update_labels_batch(batch_indices, iou=0.1, conf=0.1)
+            except Exception as e:
+                print(f"Error processing batch starting at index {start}: {e}")
+            # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example1.jpg")
+
+
+        de.save_cached_label(save_path=cache_path.replace(".cache", ".updated.cache"))
+
+    elif DATA_NAME=="flickr":
+
+
+        # set gpu 2
+        device="cuda:2"
+        de=DataEngine(device=device)
+        cache_path="/root/ultra_louis_work/datasets/flickr/annotations/final_flickr_separateGT_train_segm.merged.cache"
+        text_embed_pt="/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
+        de.load_cached_label(cache_path=cache_path, 
+                            data_style="grounding", 
+                            text_embed_pt=text_embed_pt)
+        de.load_yoloe()
+
+        batch_size=128
+        for start in tqdm(range(1000,len(de),batch_size)):
+            batch_indices=list(range(start,min(start+batch_size,len(de))))
+            batch_texts=[]
+            for indice in batch_indices:
+                label_texts = de.labels[indice].get("texts", [])
+                if isinstance(label_texts, list):
+                    for entry in label_texts:
+                        if isinstance(entry, (list, tuple)):
+                            batch_texts.extend(str(t) for t in entry)
+                        else:
+                            batch_texts.append(str(entry))
+
+            if batch_texts:
+                unique_texts = list(dict.fromkeys(batch_texts))
+                de.set_classes(name_list=unique_texts)
+            else:
+                de.set_classes(name_list=None)
+
+            # debug_indice = batch_indices[10]
+            # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example.jpg")
             de.grounding_predict_and_update_labels_batch(batch_indices, iou=0.1, conf=0.1)
-        except Exception as e:
-            print(f"Error processing batch starting at index {start}: {e}")
-        # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example1.jpg")
+            # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example1.jpg")
 
 
-    de.save_cached_label(save_path=cache_path.replace(".cache", ".updated.cache"))
-
-elif DATA_NAME=="flickr":
-
-
-    # set gpu 2
-    device="cuda:2"
-    de=DataEngine(device=device)
-    cache_path="/root/ultra_louis_work/datasets/flickr/annotations/final_flickr_separateGT_train_segm.merged.cache"
-    text_embed_pt="/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
-    de.load_cached_label(cache_path=cache_path, 
-                        data_style="grounding", 
-                        text_embed_pt=text_embed_pt)
-    de.load_yoloe()
-
-    batch_size=128
-    for start in tqdm(range(1000,len(de),batch_size)):
-        batch_indices=list(range(start,min(start+batch_size,len(de))))
-        batch_texts=[]
-        for indice in batch_indices:
-            label_texts = de.labels[indice].get("texts", [])
-            if isinstance(label_texts, list):
-                for entry in label_texts:
-                    if isinstance(entry, (list, tuple)):
-                        batch_texts.extend(str(t) for t in entry)
-                    else:
-                        batch_texts.append(str(entry))
-
-        if batch_texts:
-            unique_texts = list(dict.fromkeys(batch_texts))
-            de.set_classes(name_list=unique_texts)
-        else:
-            de.set_classes(name_list=None)
-
-        # debug_indice = batch_indices[10]
-        # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example.jpg")
-        de.grounding_predict_and_update_labels_batch(batch_indices, iou=0.1, conf=0.1)
-        # de.visual_and_save2(debug_indice, save_path="./visualized_grounding_example1.jpg")
-
-
-    de.save_cached_label(save_path=cache_path.replace(".cache", ".updated.cache"))
+        de.save_cached_label(save_path=cache_path.replace(".cache", ".updated.cache"))
