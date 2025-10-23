@@ -73,7 +73,7 @@ class DataEngine:
     def load_yoloe(self):
         from ultralytics import YOLOE
         model_path="/root/ultra_louis_work/ultralytics/yoloe-11l-seg.pt"
-        self.model=YOLOE("yoloe-11l.yaml").load(model_path)
+        self.model=YOLOE("yoloe-11l.yaml").load(model_path).to(self.device)
         print("load model from:", model_path)
 
     def set_classes(self,yaml_config=None,name_list=None, text_embed_pt=None):
@@ -339,6 +339,7 @@ class DataEngine:
         for text in append_text:
             if text not in current_texts:
                 current_texts.append(text)
+        self.labels[indice]['texts'] = [[text] for text in current_texts]  # keep the list structure
 
         # update the append_cls to match the updated texts
         updated_append_cls=[]
@@ -351,6 +352,7 @@ class DataEngine:
         append_bboxes= np.array(append_bboxes).reshape(-1,4)
         append_cls= np.array(append_cls).reshape(-1,1)
 
+        
 
         # append the boxes and cls
         for i in range(append_bboxes.shape[0]):
@@ -376,9 +378,6 @@ class DataEngine:
         
         assert self.data_style in ["grounding","detection"]
         print("Visualizing index:", indice)
-
-
-        
 
         label = self.labels[indice]
         print("label keys:", label.keys())
@@ -479,7 +478,7 @@ from tqdm import tqdm
 
 if __name__=="__main__":
         
-    DATA_NAME="mixed_grounding" #
+    DATA_NAME="flickr" #
 
     if DATA_NAME=="Objects365v1":
         de=DataEngine(device="cuda")
