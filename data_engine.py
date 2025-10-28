@@ -102,6 +102,14 @@ class DataEngine:
     def load_yoloe(self, model_path="/root/ultra_louis_work/ultralytics/yoloe-v8l-seg.pt"):
         from ultralytics import YOLOE
 
+
+        if hasattr(self,'model'):
+            # clear the existing model
+            del self.model
+
+            torch.cuda.empty_cache()
+            
+
         self.model=YOLOE("yoloe-v8l-seg.yaml").load(model_path).to(self.device)
         print("load model from:", model_path)
 
