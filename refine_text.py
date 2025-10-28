@@ -405,18 +405,19 @@ DATA_DIR="../datasets/"
 Objects365v1="../datasets/Objects365v1.yaml"
 
 
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--img_path', type=str, default=DATA_DIR+"flickr/full_images/")
+parser.add_argument('--json_file', type=str, default=DATA_DIR+"flickr/annotations/final_flickr_separateGT_train_segm.json")
+args = parser.parse_args()
+
+
 
 data= RefineGroundingDataset(
-        img_path=DATA_DIR+"flickr/full_images/",
-        json_file=DATA_DIR+"flickr/annotations/final_flickr_separateGT_train_segm.json",
+        img_path=args.img_path,
+        json_file=args.json_file,
     )
 
 
 
 
-
-
-# data= RefineGroundingDataset(     
-#         img_path=DATA_DIR+"mixed_grounding/gqa/images",
-#         json_file=DATA_DIR+"mixed_grounding/annotations/final_mixed_train_no_coco_segm.json",
-#     )
