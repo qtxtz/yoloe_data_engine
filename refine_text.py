@@ -236,7 +236,7 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
             results=self.yoloe_predict_batch([ x["labels"][i] for i in batch_indices ], conf=0.1,iou=0.4)
             assert len(results)==len(batch_indices), "Mismatch between results and batch_indices length"
             for indice,res in zip(batch_indices,results):
-                iou=0.3 # append new boxes when iou < 0.3
+                iou=0.1 # append new boxes when iou < 0.1
                 replace=False # do not replace existing boxes
                 x["labels"][indice]= self._update_grounding_label(x["labels"][indice],res,iou=iou,replace=replace)
         
@@ -416,7 +416,7 @@ data= RefineGroundingDataset(
 
 
 
-# data= RefineGroundingDataset(
+# data= RefineGroundingDataset(     
 #         img_path=DATA_DIR+"mixed_grounding/gqa/images",
 #         json_file=DATA_DIR+"mixed_grounding/annotations/final_mixed_train_no_coco_segm.json",
 #     )
