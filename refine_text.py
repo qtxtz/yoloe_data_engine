@@ -123,7 +123,7 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
 
         for img_id, anns in TQDM(imid_anns.items(), desc=f"Reading annotations {self.json_file}"):
 
-            # if img_id > 16: break  # for testing
+            if img_id > 16*10: break  # for testing
             img = images[f"{img_id:d}"]
             h, w, f = img["height"], img["width"], img["file_name"]
             im_file = Path(self.img_path) / f
@@ -212,7 +212,7 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
         
         #######  append boxes 
 
-        batch_size=32
+        batch_size=16
 
         for start in tqdm(range(0,len(x["labels"]),batch_size)):
             batch_indices=list(range(start,min(start+batch_size,len(x["labels"]))))
@@ -236,10 +236,12 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
         self.data_style="grounding"
 
         indices = list(range(len(x["labels"])))
-        results=self.yoloe_predict_batch([ x["labels"][i] for i in indices ], conf=0.01)
+        results=self.yoloe_predict_batch([ x["labels"][i] for i in indices ], conf=0.1,iou=0.4)
         assert len(results)==len(indices), "Mismatch between results and indices length"
         for indice,res in zip(indices,results):
-            x["labels"][indice]= self._update_grounding_label(x["labels"][indice],res,iou=0.5,replace=False)
+            iou=0.1 # append new boxes when iou < 0.3
+            replace=False # do not replace existing boxes
+            x["labels"][indice]= self._update_grounding_label(x["labels"][indice],res,iou=iou,replace=replace)
         
 
 
@@ -253,7 +255,7 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
             for text_list in label["texts"]:
                 texts.extend(text_list)
             print("original texts for image ",  ":", texts)
-            caption= imname_image[label["im_file"].name]["caption"]
+            caption= imname_image[label["im_file"].name]["caption"].replace(".","")
             caption_texts= caption.split()
             texts.extend(caption_texts)
             print("caption_texts for image ",  ":", caption_texts)
@@ -263,10 +265,14 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
             label['texts']= [[text] for text in matches_texts_set]
             # take cls as the index in the matched texts set
             label["cls"]= [   matches_texts_set.index(text) for text in matched_texts ]
+
+
+
             print(label['cls'])
             print(matched_texts)
             print(label['texts'])
             x["labels"][indice]= label
+
 
 
         x["hash"] = get_hash(self.json_file)

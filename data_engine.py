@@ -154,7 +154,7 @@ class DataEngine:
             print("save to:", save_path)
         return result
 
-    def yoloe_predict_batch(self, labels, conf=0.05):
+    def yoloe_predict_batch(self, labels, conf=0.05,iou=0.4):
         img_files=[]
         for label in labels:
             img_file=label['im_file']
@@ -163,7 +163,8 @@ class DataEngine:
             img_files.append(img_file)
         if not img_files:
             return []
-        return list(self.model.predict(img_files, conf=conf, batch=len(img_files),stream=True))
+        
+        return list(self.model.predict(img_files, conf=conf,iou=iou, batch=len(img_files),stream=True))
 
 
     def __len__(self):
@@ -325,7 +326,7 @@ class DataEngine:
             self.labels[indice]= self._update_grounding_label(self.labels[indice],res,iou=iou,replace=replace)
 
 
-    def _update_grounding_label(self, label, result_obj, iou=0.05, replace=True):
+    def _update_grounding_label(self, label, result_obj, iou=0.1, replace=True):
         assert self.data_style == "grounding", "_update_grounding_label requires grounding data_style"
         boxes=result_obj.boxes
         bboxes_xyxy=boxes.xyxy.cpu().numpy()
