@@ -69,6 +69,9 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
         matched_indices = similarities.argmax(dim=-1)  # (N,)
         matched_texts = [texts[i] for i in matched_indices.tolist()]
         return matched_texts
+
+
+
     
 
     def cache_labels(self, path: Path = Path("./labels.cache")) -> dict[str, Any]:
@@ -111,6 +114,8 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
 
 
         for img_id, anns in TQDM(imid_anns.items(), desc=f"Reading annotations {self.json_file}"):
+
+            if img_id > 16: break  # for testing
             img = images[f"{img_id:d}"]
             h, w, f = img["height"], img["width"], img["file_name"]
             im_file = Path(self.img_path) / f
@@ -216,6 +221,8 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
                 self.set_classes(name_list=None)
 
 
+        self.data_style="grounding"
+
         indices = list(range(len(x["labels"])))
         results=self.yoloe_predict_batch([ x["labels"][i] for i in indices ], conf=0.01)
         assert len(results)==len(indices), "Mismatch between results and indices length"
@@ -243,7 +250,7 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
             label["cls"]= np.array( [[i] for i in range(len(matches_texts_set))], dtype=np.float32)
 
 
-
+        x["hash"] = get_hash(self.json_file)
 
 
         save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
@@ -385,7 +392,7 @@ data= RefineGroundingDataset(
 
 
 
-data= RefineGroundingDataset(
-        img_path=DATA_DIR+"mixed_grounding/gqa/images",
-        json_file=DATA_DIR+"mixed_grounding/annotations/final_mixed_train_no_coco_segm.json",
-    )
+# data= RefineGroundingDataset(
+#         img_path=DATA_DIR+"mixed_grounding/gqa/images",
+#         json_file=DATA_DIR+"mixed_grounding/annotations/final_mixed_train_no_coco_segm.json",
+#     )
