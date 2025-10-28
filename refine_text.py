@@ -212,7 +212,7 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
         
         #######  append boxes 
 
-        batch_size=32
+        batch_size=16
 
         for start in tqdm(range(0,len(x["labels"]),batch_size)):
             batch_indices=list(range(start,min(start+batch_size,len(x["labels"]))))
@@ -253,7 +253,7 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
             for text_list in label["texts"]:
                 texts.extend(text_list)
             print("original texts for image ",  ":", texts)
-            caption= imname_image[label["im_file"].name]["caption"]
+            caption= imname_image[label["im_file"].name]["caption"].replace(".","")
             caption_texts= caption.split()
             texts.extend(caption_texts)
             print("caption_texts for image ",  ":", caption_texts)
