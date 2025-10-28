@@ -123,7 +123,7 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
 
         for img_id, anns in TQDM(imid_anns.items(), desc=f"Reading annotations {self.json_file}"):
 
-            if img_id > 16*10: break  # for testing
+            # if img_id > 16*10: break  # for testing
             img = images[f"{img_id:d}"]
             h, w, f = img["height"], img["width"], img["file_name"]
             im_file = Path(self.img_path) / f
@@ -212,8 +212,9 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
         
         #######  append boxes 
 
-        batch_size=16
+        batch_size=64
 
+        self.data_style="grounding"
         for start in tqdm(range(0,len(x["labels"]),batch_size)):
             batch_indices=list(range(start,min(start+batch_size,len(x["labels"]))))
             batch_texts=[]
@@ -232,18 +233,16 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
             else:
                 self.set_classes(name_list=None)
 
-
-        self.data_style="grounding"
-
-        indices = list(range(len(x["labels"])))
-        results=self.yoloe_predict_batch([ x["labels"][i] for i in indices ], conf=0.1,iou=0.4)
-        assert len(results)==len(indices), "Mismatch between results and indices length"
-        for indice,res in zip(indices,results):
-            iou=0.1 # append new boxes when iou < 0.3
-            replace=False # do not replace existing boxes
-            x["labels"][indice]= self._update_grounding_label(x["labels"][indice],res,iou=iou,replace=replace)
+            results=self.yoloe_predict_batch([ x["labels"][i] for i in batch_indices ], conf=0.1,iou=0.4)
+            assert len(results)==len(batch_indices), "Mismatch between results and batch_indices length"
+            for indice,res in zip(batch_indices,results):
+                iou=0.3 # append new boxes when iou < 0.3
+                replace=False # do not replace existing boxes
+                x["labels"][indice]= self._update_grounding_label(x["labels"][indice],res,iou=iou,replace=replace)
         
 
+
+        self.load_yoloe()  # reload to reset class number
 
         #####  refine the bbox texts
         imname_image = {im["file_name"]: im for im in annotations["images"]}
