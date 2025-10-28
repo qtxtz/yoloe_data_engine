@@ -4,3 +4,4 @@
 *.pt
 
 __pycahce__\
+*.pyc

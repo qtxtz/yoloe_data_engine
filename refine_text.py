@@ -90,7 +90,7 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
             annotations = json.load(f)
 
 
-        images = {f"{im['id']:d}": im for im in annotations["images"]}
+        # images = {f"{im['id']:d}": im for im in annotations["images"]}
 
         # Map image IDs to file names
         imid_imname = {f"{im['id']:d}": im["file_name"] for im in annotations["images"]}
@@ -103,11 +103,19 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
             imname_anns[imname].append(ann)
         
 
-        # map sample id to the annotations
-        img_ids= [im["id"] for im in annotations["images"]]
-        imid_anns= defaultdict(list)
-        for id in img_ids:
-            imid_anns[id]=imname_anns[imid_imname[f"{id:d}"]]
+
+
+        # # map sample id to the annotations
+        # img_ids= [im["id"] for im in annotations["images"]]
+        # imid_anns= defaultdict(list)
+        # for id in img_ids:
+        #     imid_anns[id]=imname_anns[imid_imname[f"{id:d}"]]
+
+        images = {f"{x['id']:d}": x for x in annotations["images"]}
+        imid_anns = defaultdict(list)
+        for ann in annotations["annotations"]:
+            imid_anns[ann["image_id"]].append(ann)
+
 
         if not hasattr(self, 'model') or self.model is None:
             self.load_yoloe()
@@ -115,7 +123,7 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
 
         for img_id, anns in TQDM(imid_anns.items(), desc=f"Reading annotations {self.json_file}"):
 
-            if img_id > 16: break  # for testing
+            # if img_id > 16: break  # for testing
             img = images[f"{img_id:d}"]
             h, w, f = img["height"], img["width"], img["file_name"]
             im_file = Path(self.img_path) / f
@@ -127,7 +135,11 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
             segments = []
             cat2id = {}
             texts = []
-            for ann in anns:
+
+
+            anns_for_img=imname_anns[f]
+
+            for ann in anns + anns_for_img:
 
                 if len(bboxes_xyxy) > 0 and YoloBox([int(h),int(w)]).load_from_xyxy(bboxes_xyxy).iou(ann["bbox"]).max()>0.98:
                     # print("skip duplicate box")
@@ -200,7 +212,7 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
         
         #######  append boxes 
 
-        batch_size=16
+        batch_size=32
 
         for start in tqdm(range(0,len(x["labels"]),batch_size)):
             batch_indices=list(range(start,min(start+batch_size,len(x["labels"]))))
@@ -233,21 +245,28 @@ class RefineGroundingDataset(GroundingDataset, DataEngine):
 
         #####  refine the bbox texts
         imname_image = {im["file_name"]: im for im in annotations["images"]}
-        for label in tqdm(x["labels"], desc="Refining texts for grounding data"):
+        for indice,label in tqdm(enumerate(x["labels"]), desc="Refining texts for grounding data"):
             bboxes_xyxy= YoloBox((int(label["shape"][0]),int(label["shape"][1]))).load_from_xywhn_normalized(label["bboxes"]).xyxy
             visual={"bboxes": bboxes_xyxy,
                     "cls": list(range(bboxes_xyxy.shape[0]))}
             texts= []
             for text_list in label["texts"]:
                 texts.extend(text_list)
+            print("original texts for image ",  ":", texts)
             caption= imname_image[label["im_file"].name]["caption"]
             caption_texts= caption.split()
             texts.extend(caption_texts)
+            print("caption_texts for image ",  ":", caption_texts)
             texts= list(set(texts))
             matched_texts= self.vpe_text(source= label["im_file"], visual_prompts= visual, texts= texts)
-            matches_texts_set= set(matched_texts)
+            matches_texts_set= list(set(matched_texts))
             label['texts']= [[text] for text in matches_texts_set]
-            label["cls"]= np.array( [[i] for i in range(len(matches_texts_set))], dtype=np.float32)
+            # take cls as the index in the matched texts set
+            label["cls"]= [   matches_texts_set.index(text) for text in matched_texts ]
+            print(label['cls'])
+            print(matched_texts)
+            print(label['texts'])
+            x["labels"][indice]= label
 
 
         x["hash"] = get_hash(self.json_file)
