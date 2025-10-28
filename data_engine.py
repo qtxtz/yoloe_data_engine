@@ -47,8 +47,21 @@ class YoloBox(object):
         self.xywhn=bboxes_xywhn
         return self
     def load_from_xyxy(self,bboxes_xyxy):
+        if isinstance(bboxes_xyxy,list):
+            bboxes_xyxy=np.array(bboxes_xyxy)
+        
+        # Ensure the array is of a numeric type
+        bboxes_xyxy = np.array(bboxes_xyxy, dtype=np.float32)
+
         # xyxy: [N,4]  x0,y0,x1,y1
         bboxes_xywhn = np.zeros_like(bboxes_xyxy)
+        # 在 data_engine.py 的 load_from_xyxy 方法中，出错行前添加：
+        # print("=== 调试信息 ===")
+        # print("bboxes_xyxy 类型:", type(bboxes_xyxy))  # 应输出 <class 'numpy.ndarray'> 或 torch.Tensor
+        # print("bboxes_xyxy 形状:", bboxes_xyxy.shape if hasattr(bboxes_xyxy, 'shape') else "无形状")  # 应输出 (N,4)
+        # print("bboxes_xyxy 元素类型:", bboxes_xyxy.dtype if hasattr(bboxes_xyxy, 'dtype') else "无 dtype")  # 应是 float32/int64
+        # print("self.img_w 类型:", type(self.img_w), "值:", self.img_w)  # 应是 int/float（如 640）
+        # print("self.img_h 类型:", type(self.img_h), "值:", self.img_h)
         if bboxes_xyxy.shape[0] > 0:
             bboxes_xywhn[:, 0] = ((bboxes_xyxy[:, 0] + bboxes_xyxy[:, 2]) / 2) / self.img_w
             bboxes_xywhn[:, 1] = ((bboxes_xyxy[:, 1] + bboxes_xyxy[:, 3]) / 2) / self.img_h
@@ -59,6 +72,24 @@ class YoloBox(object):
 
         self.xywhn=bboxes_xywhn
         return self
+    
+    def iou(self,bbox_xyxy):
+        # bbox_xyxy: [4,]  x0,y0,x1,y1
+        assert self.xyxy is not None, "self.xyxy is None, please load the box first"
+        ious=[]
+        for i in range(self.xyxy.shape[0]):
+            box=self.xyxy[i]
+            xi1=max(box[0],bbox_xyxy[0])
+            yi1=max(box[1],bbox_xyxy[1])
+            xi2=min(box[2],bbox_xyxy[2])
+            yi2=min(box[3],bbox_xyxy[3])
+            inter_area=max(0,xi2-xi1)*max(0,yi2-yi1)
+            box1_area=(box[2]-box[0])*(box[3]-box[1])
+            box2_area=(bbox_xyxy[2]-bbox_xyxy[0])*(bbox_xyxy[3]-bbox_xyxy[1])
+            union_area=box1_area+box2_area-inter_area
+            iou=inter_area/union_area if union_area>0 else 0
+            ious.append(iou)
+        return np.array(ious)
 
 
 import torch
@@ -68,12 +99,10 @@ class DataEngine:
     def __init__(self,device="cuda"):
         self.device=device
 
-
-
-    def load_yoloe(self):
+    def load_yoloe(self, model_path="/root/ultra_louis_work/ultralytics/yoloe-v8l-seg.pt"):
         from ultralytics import YOLOE
-        model_path="/root/ultra_louis_work/ultralytics/yoloe-11l-seg.pt"
-        self.model=YOLOE("yoloe-11l.yaml").load(model_path).to(self.device)
+
+        self.model=YOLOE("yoloe-v8l-seg.yaml").load(model_path).to(self.device)
         print("load model from:", model_path)
 
     def set_classes(self,yaml_config=None,name_list=None, text_embed_pt=None):
@@ -117,16 +146,17 @@ class DataEngine:
             print("save to:", save_path)
         return result
 
-    def yoloe_predict_batch(self, indices, conf=0.05):
+    def yoloe_predict_batch(self, labels, conf=0.05):
         img_files=[]
-        for indice in indices:
-            img_file=self.labels[indice]['im_file']
+        for label in labels:
+            img_file=label['im_file']
             if hasattr(self,'img_source'):
                 img_file=os.path.join(self.img_source,img_file)
             img_files.append(img_file)
         if not img_files:
             return []
-        return list(self.model.predict(img_files, conf=conf, batch=len(img_files)))
+        return list(self.model.predict(img_files, conf=conf, batch=len(img_files),stream=True))
+
 
     def __len__(self):
         return len(self.labels)
@@ -169,7 +199,7 @@ class DataEngine:
             else:
                 print("Load text embed from:", text_embed_pt)
             txt_map = torch.load(text_embed_pt, map_location=self.device, weights_only=False)
-            self.names=list(txt_map.keys())
+            self.names=list(txt_map.keys()) 
 
 
     def print_data_info(self):
@@ -180,13 +210,16 @@ class DataEngine:
         - Total number of boxes (for detection and grounding)
         """
         print(f"Data style: {self.data_style}")
+        print("Keys: {}".format(self.labels[0].keys() if len(self.labels)>0 else "No labels")   )
         print(f"Total number of labels: {len(self.labels)}")
         if self.data_style in ["detection", "grounding"]:
             total_boxes = sum(len(label.get("bboxes", [])) for label in self.labels)
             print(f"Total number of boxes: {total_boxes}")
 
 
-
+    def remove_masks_and_segments(self):
+        for label in tqdm(self.labels):
+            label["segments"]=[]
 
     def save_cached_label(self,save_path=None):
         if save_path is None:
@@ -229,7 +262,7 @@ class DataEngine:
         self._update_detection_label(indice,result[0],iou=iou,replace=replace)
 
     def detection_predict_and_update_labels_batch(self, indices, iou=0.3, replace=False, conf=0.1):
-        results=self.yoloe_predict_batch(indices, conf=conf)
+        results=self.yoloe_predict_batch([ self.labels[i] for i in indices ], conf=conf)
         assert len(results)==len(indices), "Mismatch between results and indices length"
         for indice,res in zip(indices,results):
             self._update_detection_label(indice,res,iou=iou,replace=replace)
@@ -281,10 +314,10 @@ class DataEngine:
         results=self.yoloe_predict_batch(indices, conf=conf)
         assert len(results)==len(indices), "Mismatch between results and indices length"
         for indice,res in zip(indices,results):
-            self._update_grounding_label(indice,res,iou=iou,replace=replace)
+            self.labels[indice]= self._update_grounding_label(self.labels[indice],res,iou=iou,replace=replace)
 
 
-    def _update_grounding_label(self, indice, result_obj, iou=0.05, replace=True):
+    def _update_grounding_label(self, label, result_obj, iou=0.05, replace=True):
         assert self.data_style == "grounding", "_update_grounding_label requires grounding data_style"
         boxes=result_obj.boxes
         bboxes_xyxy=boxes.xyxy.cpu().numpy()
@@ -295,16 +328,16 @@ class DataEngine:
         assert bboxes_xywhn.shape[0]==cls.shape[0], "Mismatch between number of boxes and classes"
 
         if replace:
-            self.labels[indice]['bboxes']=bboxes_xywhn
-            self.labels[indice]['cls']=cls
+            label['bboxes']=bboxes_xywhn
+            label['cls']=cls
             print(f"Replace with {bboxes_xywhn.shape[0]} boxes")  
             return
         keep_indices=[]
         for i in range(bboxes_xywhn.shape[0]):
             bbox=bboxes_xywhn[i]
             max_iou=0
-            for j in range(self.labels[indice]['bboxes'].shape[0]):
-                exist_bbox=self.labels[indice]['bboxes'][j]
+            for j in range(label['bboxes'].shape[0]):
+                exist_bbox=label['bboxes'][j]
                 box1=YoloBox(img_shape=result_obj.orig_img.shape[:2]).load_from_xywhn_normalized(bbox[np.newaxis,:]).xyxy[0]
                 box2=YoloBox(img_shape=result_obj.orig_img.shape[:2]).load_from_xywhn_normalized(exist_bbox[np.newaxis,:]).xyxy[0]
                 xi1=max(box1[0],box2[0])
@@ -322,7 +355,7 @@ class DataEngine:
                 keep_indices.append(i)
 
         # get  current texts
-        current_texts= self.labels[indice]['texts']
+        current_texts= label['texts']
         current_texts= [ text[0] for text in current_texts] # remote the list structure inside
 
 
@@ -339,7 +372,8 @@ class DataEngine:
         for text in append_text:
             if text not in current_texts:
                 current_texts.append(text)
-        self.labels[indice]['texts'] = [[text] for text in current_texts]  # keep the list structure
+        label['texts'] = [[text] for text in current_texts]  # keep the list structure
+
 
         # update the append_cls to match the updated texts
         updated_append_cls=[]
@@ -358,10 +392,11 @@ class DataEngine:
         for i in range(append_bboxes.shape[0]):
             bbox=append_bboxes[i]
             c=append_cls[i]
-            self.labels[indice]['bboxes']=np.vstack([self.labels[indice]['bboxes'],bbox])
-            self.labels[indice]['cls']=np.vstack([self.labels[indice]['cls'],c])
+            label['bboxes']=np.vstack([label['bboxes'],bbox])
+            label['cls']=np.vstack([label['cls'],c])
         # print how many boxes are appended
         print(f"Append {append_bboxes.shape[0]} new boxes out of {bboxes_xywhn.shape[0]}")
+        return label
 
 
 
