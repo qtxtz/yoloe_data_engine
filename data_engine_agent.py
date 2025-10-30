@@ -6,7 +6,7 @@ print("set workspace:", workspace)
 
 from collections import defaultdict
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import os
 import numpy as np
@@ -17,6 +17,11 @@ from yoloe_data_engine.data_engine import DataEngine
 import copy
 import numpy as np
 from pathlib import Path as _Path
+
+IMAGES_CACHE = None
+IMNAME_ANNS_CACHE = None
+
+
 def to_serializable(obj):
     if hasattr(obj, "item") and not isinstance(obj, (bytes, bytearray)):
         try:
@@ -33,6 +38,16 @@ def to_serializable(obj):
         return {k: to_serializable(v) for k, v in obj.items()}
     return obj
 
+
+def init_worker(images_data, imname_anns_data):
+    """Initializer for worker processes to avoid repeatedly pickling large state."""
+    global IMAGES_CACHE, IMNAME_ANNS_CACHE
+    IMAGES_CACHE = images_data
+    IMNAME_ANNS_CACHE = imname_anns_data
+
+
+def worker_wrapper(args):
+    return DataEngineAgent._load_grounding_data(*args)
 
 class YoloBox:
     def __init__(self, img_shape: list):
@@ -280,25 +295,27 @@ class DataEngineAgent:
             for future in tqdm(as_completed(futures), total=len(futures), desc="Model predict ..."):
                 future.result()
         return results
-
-    def _load_grounding_data(self, imid, anns, images, imname_anns, labels, indice, folder_name):
-        dst_dir = os.path.join(self.buffer_dir, folder_name)
+    @staticmethod
+    def _load_grounding_data(buffer_dir, im_dir, imid, anns, folder_name):
+        """Worker invoked in subprocesses to build per-image grounding labels."""
+        global IMAGES_CACHE, IMNAME_ANNS_CACHE
+        dst_dir = os.path.join(buffer_dir, folder_name)
         os.makedirs(dst_dir, exist_ok=True)
         dst_file = os.path.join(dst_dir, str(imid) + ".json")
         if os.path.exists(dst_file):
             return
         from ultralytics.data.converter import merge_multi_segment
         from ultralytics.data.dataset import segments2boxes
-        img = images[f"{imid:d}"]
+        img = IMAGES_CACHE[f"{imid:d}"]
         h, w, f = img["height"], img["width"], img["file_name"]
-        im_file = Path(self.im_dir) / f
+        im_file = Path(im_dir) / f  # Use the passed im_dir
         bboxes_xyxy = []
         bboxes = []
         segments = []
         cat2id = {}
         texts = []
-        if imname_anns is not None:
-            anns_for_img = imname_anns[f]
+        if IMNAME_ANNS_CACHE is not None:
+            anns_for_img = IMNAME_ANNS_CACHE.get(f, [])
         else:
             anns_for_img = []
         for ann in anns + anns_for_img:
@@ -343,10 +360,10 @@ class DataEngineAgent:
             lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)
         lb = np.array(lb, dtype=np.float32)
         label = {
-            "im_file": im_file,
+            "im_file": str(im_file),
             "shape": (h, w),
-            "cls": lb[:, 0:1],
-            "bboxes": lb[:, 1:],
+            "cls": lb[:, 0:1] if lb.size > 0 else [],
+            "bboxes": lb[:, 1:] if lb.size > 0 else [],
             "segments": [],
             "normalized": True,
             "bbox_format": "xywh",
@@ -371,44 +388,55 @@ class DataEngineAgent:
             lc["bbox_format"] = str(lc.get("bbox_format", "xywh"))
             return lc
         label_serialized = serializeLabel(label)
-        tmp_file = str(dst_file) + ".tmp"
+        # tmp_file = str(dst_file) + ".tmp"
         import json
-        with open(tmp_file, "w") as file:
+        with open(dst_file, "w") as file:
             json.dump(label_serialized, file, indent=4, ensure_ascii=False)
-        os.replace(tmp_file, str(dst_file))
-        print(f"Saved sample to {dst_file}")
+        # os.replace(tmp_file, str(dst_file))
+        # print(f"Saved sample to {dst_file}")
 
-    def multi_thread_load_grounding_data(self, im_dir, json_file, merge_within_one_image, max_workers=8):
+    def multi_process_load_grounding_data(self, im_dir, json_file, merge_within_one_image, max_workers=8):
 
-        print("Start multi-threaded loading of grounding data...")
+        print("Start multi-process loading of grounding data...")
         self.im_dir = im_dir
         with open(json_file) as f:
             annotations = json.load(f)
-        images = {f"{x['id']:d}": x for x in annotations["images"]}
+        images_data = {f"{x['id']:d}": x for x in annotations["images"]}
         imid_imname = {f"{im['id']:d}": im["file_name"] for im in annotations["images"]}
         if merge_within_one_image:
-            imname_anns = defaultdict(list)
+            imname_anns_data = defaultdict(list)
             for ann in annotations["annotations"]:
                 imid = ann["image_id"]
                 imname = imid_imname[f"{imid:d}"]
-                ann["caption"] = images[f"{ann['image_id']:d}"]["caption"]
-                imname_anns[imname].append(ann)
+                ann["caption"] = images_data[f"{ann['image_id']:d}"]["caption"]
+                imname_anns_data[imname].append(ann)
             folder_name = "grounding_data_merged"
         else:
-            imname_anns = None
+            imname_anns_data = None
             folder_name = "grounding_data"
         imid_anns = defaultdict(list)
         for ann in annotations["annotations"]:
-            ann["caption"] = images[f"{ann['image_id']:d}"]["caption"]
+            ann["caption"] = images_data[f"{ann['image_id']:d}"]["caption"]
             imid_anns[ann["image_id"]].append(ann)
         self.img_path = annotations.get("img_path", "")
         imids = list(imid_anns.keys())
-        labels = [None] * len(imids)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self._load_grounding_data, imid, imid_anns[imid], images, imname_anns, labels, indice, folder_name) for indice, imid in enumerate(imids)}
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Loading grounding data"):
-                future.result()
-        self.labels = labels
+        
+        print(f"Total images to process: {len(imids)}")
+
+        init_args = (images_data, imname_anns_data)
+        worker_count = max_workers if max_workers is not None else (os.cpu_count() or 1)
+
+        # Use executor.map with initializer so each worker receives heavy state only once.
+        with ProcessPoolExecutor(max_workers=max_workers, initializer=init_worker, initargs=init_args) as executor:
+            tasks = [(self.buffer_dir, self.im_dir, imid, imid_anns[imid], folder_name) for imid in imids]
+
+            # The chunksize is critical for performance. It determines how many tasks are sent to a worker at once.
+            chunk_size = max(1, min(500, len(imids) // (worker_count * 4) if worker_count > 0 else 1))
+            print(f"Using {worker_count} workers and chunksize: {chunk_size}")
+
+            list(tqdm(executor.map(worker_wrapper, tasks, chunksize=chunk_size), total=len(tasks), desc="Loading grounding data"))
+
+        print("Finished loading grounding data.")
 
     def _merge_predict(self):
         pass
@@ -433,7 +461,7 @@ if __name__ == "__main__":
     # agent = DataEngineAgent(devices=devices, buffer_dir="/root/ultra_louis_work/runs/flickr_engine_buffer")
     # json_file = "/root/ultra_louis_work/datasets/flickr/annotations/final_flickr_separateGT_train_segm.json"
     # im_dir = "../datasets/flickr/full_images/"
-    mobileclip_text_embed_pt="/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
+    # mobileclip_text_embed_pt="/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
 
 
     agent = DataEngineAgent(devices=devices, buffer_dir="/root/ultra_louis_work/runs/mixed_engine_buffer")
@@ -443,20 +471,20 @@ if __name__ == "__main__":
     mobileclip_text_embed_pt="/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
 
 
-    agent.load_model_engine()
-    text_list=None
-    for index,model in enumerate(agent.models):
-        if text_list is None:       
-            text_embed_pt = mobileclip_text_embed_pt
-            model.set_classes(text_embed_pt=text_embed_pt)
-            text_list=model.names
-        else:
-            model.set_classes(name_list=text_list)
+    # agent.load_model_engine()
+    # text_list=None
+    # for index,model in enumerate(agent.models):
+    #     if text_list is None:       
+    #         text_embed_pt = mobileclip_text_embed_pt
+    #         model.set_classes(text_embed_pt=text_embed_pt)
+    #         text_list=model.names
+    #     else:
+    #         model.set_classes(name_list=text_list)
 
-    agent.multi_process_batch_model_predict(im_dir=im_dir, texts=None, conf=0.5, iou=0.4,batch_size=3)
+    # agent.multi_process_batch_model_predict(im_dir=im_dir, texts=None, conf=0.5, iou=0.4,batch_size=3)
 
 
-    # agent.multi_thread_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=1)
+    agent.multi_process_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=8)
 
 
 
