@@ -1,10 +1,37 @@
-from collections import defaultdict
+import ultralytics,os
+workspace = os.path.dirname(os.path.dirname(os.path.abspath(ultralytics.__file__)))
+os.chdir(workspace)
+print("set workspace:", workspace)
 
+
+from collections import defaultdict
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 import os
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
 from yoloe_data_engine.data_engine import DataEngine
+
+import copy
+import numpy as np
+from pathlib import Path as _Path
+def to_serializable(obj):
+    if hasattr(obj, "item") and not isinstance(obj, (bytes, bytearray)):
+        try:
+            return obj.item()
+        except Exception:
+            pass
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, _Path):
+        return str(obj)
+    if isinstance(obj, (list, tuple)):
+        return [to_serializable(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: to_serializable(v) for k, v in obj.items()}
+    return obj
 
 
 class YoloBox:
@@ -89,12 +116,12 @@ class Instance:
 
     def to_dict(self):
         return {
-            'bbox': self.bbox,
-            'text': self.text,
-            'conf': self.conf,
-            'embed': self.embed.tolist() if self.embed is not None else None,
-            'vp': self.vpe.tolist() if self.vpe is not None else None,
-            'other_data': self.other_data
+            'bbox': to_serializable(self.bbox),
+            'text': to_serializable(self.text),
+            'conf': to_serializable(self.conf),
+            'embed': to_serializable(self.embed),
+            'vp': to_serializable(self.vpe),
+            'other_data': to_serializable(self.other_data)
         }
 
 class Sample:
@@ -156,11 +183,6 @@ class Sample:
         grounding_data['bbox_format'] = 'xywhn'
         return grounding_data
 
-    def save_to_json(self, json_path):
-        import json
-        with open(json_path, 'w') as f:
-            json.dump(self.to_dict(), f, indent=4)
-        print(f"Saved sample to {json_path}")
 
     def load_from_yoloe_result(self, yoloe_result):
         self.instances = []
@@ -178,10 +200,17 @@ class Sample:
 
     def to_dict(self):
         return {
-            'im_file': self.im_file,
+            'im_file': to_serializable(self.im_file),
             'instances': [inst.to_dict() for inst in self.instances],
-            'other_data': self.other_data
+            'other_data': to_serializable(self.other_data)
         }
+    
+    def save_to_json(self, json_path):
+        import json
+        with open(json_path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=4)
+        print(f"Saved sample to {json_path}")
+
 
 class DataEngineAgent:
     def __init__(self, devices=["cuda:0"], buffer_dir="/root/ultra_louis_work/engine_buffer"):
@@ -202,6 +231,8 @@ class DataEngineAgent:
             model.set_classes(texts)
         self.texts = texts
 
+
+
     def _batch_model_predict_single_process(self, im_files, engine: DataEngine, **kwargs):
         dst_dir = os.path.join(self.buffer_dir, "model_predict")
         os.makedirs(dst_dir, exist_ok=True)
@@ -214,22 +245,26 @@ class DataEngineAgent:
         dst_files = [os.path.join(dst_dir, f"{name}.json") for name in im_names_wo_ext]
         indices = [i for i in range(len(im_files)) if not os.path.exists(dst_files[i])]
         if len(indices) == 0:
+            print("All images have been processed, skip.")
             return
         process_img_files = [im_files[i] for i in indices]
         results = list(engine.model.predict(process_img_files, conf=conf, iou=iou, batch=len(process_img_files), stream=True))
+        print(f"Processed {len(process_img_files)} images.")
         for i, sample_index in enumerate(indices):
             sample = Sample()
             result = results[i]
             sample.load_from_yoloe_result(result)
             sample.save_to_json(dst_files[sample_index])
         return
-
-    def multi_process_batch_model_predict(self, im_dir, texts=None, conf=0.5, iou=0.4, batch_size=4, max_workers=None):
+    
+    def multi_process_batch_model_predict(self, im_dir, texts=None, conf=0.5, iou=0.4, batch_size=3, max_workers=None):
         from concurrent.futures import ThreadPoolExecutor, as_completed
         im_files = []
         for file_name in os.listdir(im_dir):
             if file_name.endswith((".jpg", ".jpeg", ".png", ".bmp")):
                 im_files.append(os.path.join(im_dir, file_name))
+
+        # im_files=im_files[:128]
         print(f"Total images to process: {len(im_files)}")
         batches = [im_files[i:i+batch_size] for i in range(0, len(im_files), batch_size)]
         print(f"Total batches: {len(batches)}, batch size: {batch_size}")
@@ -242,8 +277,8 @@ class DataEngineAgent:
                 model = self.models[i % len(self.models)]
                 kwargs = {'conf': conf, 'iou': iou, 'texts': texts}
                 futures.append(executor.submit(self._batch_model_predict_single_process, batch, model, **kwargs))
-            for future in as_completed(futures):
-                results.append(future.result())
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Model predict ..."):
+                future.result()
         return results
 
     def _load_grounding_data(self, imid, anns, images, imname_anns, labels, indice, folder_name):
@@ -318,24 +353,8 @@ class DataEngineAgent:
             "texts": texts,
         }
         def serializeLabel(label):
-            import copy
-            import numpy as np
-            from pathlib import Path as _Path
-            def to_serializable(obj):
-                if hasattr(obj, "item") and not isinstance(obj, (bytes, bytearray)):
-                    try:
-                        return obj.item()
-                    except Exception:
-                        pass
-                if isinstance(obj, np.ndarray):
-                    return obj.tolist()
-                if isinstance(obj, _Path):
-                    return str(obj)
-                if isinstance(obj, (list, tuple)):
-                    return [to_serializable(x) for x in obj]
-                if isinstance(obj, dict):
-                    return {k: to_serializable(v) for k, v in obj.items()}
-                return obj
+
+
             lc = copy.deepcopy(label)
             lc["im_file"] = str(lc.get("im_file", ""))
             lc["shape"] = list(lc.get("shape", []))
@@ -360,9 +379,7 @@ class DataEngineAgent:
         print(f"Saved sample to {dst_file}")
 
     def multi_thread_load_grounding_data(self, im_dir, json_file, merge_within_one_image, max_workers=8):
-        import json
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from tqdm import tqdm
+
         print("Start multi-threaded loading of grounding data...")
         self.im_dir = im_dir
         with open(json_file) as f:
@@ -393,6 +410,12 @@ class DataEngineAgent:
                 future.result()
         self.labels = labels
 
+    def _merge_predict(self):
+        pass
+
+    
+
+
 def read_numpy_and_print(path=None):
     def load_dataset_cache_file(path: Path) -> dict:
         import gc
@@ -405,7 +428,7 @@ def read_numpy_and_print(path=None):
     print(data)
 
 if __name__ == "__main__":
-    devices = ["cuda:0"]
+    devices = ["cuda:0","cuda:1","cuda:2","cuda:3"]
     agent = DataEngineAgent(devices=devices, buffer_dir="/root/ultra_louis_work/runs/flickr_engine_buffer")
     # agent.load_model_engine(model_path="/root/ultra_louis_work/ultralytics/yoloe-v8l-seg.pt")
     # json_file = "/root/ultra_louis_work/datasets/flickr/annotations/final_flickr_separateGT_train_segm.json"
