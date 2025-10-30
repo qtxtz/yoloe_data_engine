@@ -413,7 +413,7 @@ class DataEngineAgent:
     def _merge_predict(self):
         pass
 
-    
+
 
 
 def read_numpy_and_print(path=None):
@@ -429,11 +429,17 @@ def read_numpy_and_print(path=None):
 
 if __name__ == "__main__":
     devices = ["cuda:0","cuda:1","cuda:2","cuda:3"]
-    agent = DataEngineAgent(devices=devices, buffer_dir="/root/ultra_louis_work/runs/flickr_engine_buffer")
-    # agent.load_model_engine(model_path="/root/ultra_louis_work/ultralytics/yoloe-v8l-seg.pt")
+
+    # agent = DataEngineAgent(devices=devices, buffer_dir="/root/ultra_louis_work/runs/flickr_engine_buffer")
     # json_file = "/root/ultra_louis_work/datasets/flickr/annotations/final_flickr_separateGT_train_segm.json"
     # im_dir = "../datasets/flickr/full_images/"
-    # agent.multi_thread_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=1)
+    agent = DataEngineAgent(devices=devices, buffer_dir="/root/ultra_louis_work/runs/mixed_engine_buffer")
+    json_file= "../datasets/mixed_grounding/annotations/final_mixed_train_no_coco_segm.json"
+    im_dir="../datasets/mixed_grounding/gqa/images"
+
+
+
+
     agent.load_model_engine(model_path="/root/ultra_louis_work/ultralytics/yoloe-v8l-seg.pt")
     for model in agent.models:
         text_embed_pt = "/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
@@ -441,7 +447,7 @@ if __name__ == "__main__":
 
     agent.multi_process_batch_model_predict(im_dir="../datasets/flickr/full_images/", texts=None, conf=0.5, iou=0.4)
 
-
+    agent.multi_thread_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=1)
 
 
 
