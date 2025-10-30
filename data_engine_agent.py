@@ -209,7 +209,7 @@ class Sample:
         import json
         with open(json_path, 'w') as f:
             json.dump(self.to_dict(), f, indent=4)
-        print(f"Saved sample to {json_path}")
+        # print(f"Saved sample to {json_path}")
 
 
 class DataEngineAgent:
@@ -218,12 +218,12 @@ class DataEngineAgent:
         os.makedirs(self.buffer_dir, exist_ok=True)
         self.devices = devices
 
-    def load_model_engine(self, model_path=None):
-        self.model_path = model_path
+    def load_model_engine(self):
+        # self.model_path = model_path
         self.models = []
         for device in self.devices:
             de = DataEngine(device=device)
-            de.load_yoloe(model_path=self.model_path)
+            de.load_yoloe()
             self.models.append(de)
 
     def set_classes(self, texts: list):
@@ -433,21 +433,30 @@ if __name__ == "__main__":
     # agent = DataEngineAgent(devices=devices, buffer_dir="/root/ultra_louis_work/runs/flickr_engine_buffer")
     # json_file = "/root/ultra_louis_work/datasets/flickr/annotations/final_flickr_separateGT_train_segm.json"
     # im_dir = "../datasets/flickr/full_images/"
+    mobileclip_text_embed_pt="/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
+
+
     agent = DataEngineAgent(devices=devices, buffer_dir="/root/ultra_louis_work/runs/mixed_engine_buffer")
     json_file= "../datasets/mixed_grounding/annotations/final_mixed_train_no_coco_segm.json"
     im_dir="../datasets/mixed_grounding/gqa/images"
+    # mobileclip_text_embed_pt="/root/ultra_louis_work/datasets/mixed_grounding/gqa/text_embeddings_mobileclip_blt.pt"
+    mobileclip_text_embed_pt="/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
 
 
+    agent.load_model_engine()
+    text_list=None
+    for index,model in enumerate(agent.models):
+        if text_list is None:       
+            text_embed_pt = mobileclip_text_embed_pt
+            model.set_classes(text_embed_pt=text_embed_pt)
+            text_list=model.names
+        else:
+            model.set_classes(name_list=text_list)
+
+    agent.multi_process_batch_model_predict(im_dir=im_dir, texts=None, conf=0.5, iou=0.4,batch_size=3)
 
 
-    agent.load_model_engine(model_path="/root/ultra_louis_work/ultralytics/yoloe-v8l-seg.pt")
-    for model in agent.models:
-        text_embed_pt = "/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
-        model.set_classes(text_embed_pt=text_embed_pt)
-
-    agent.multi_process_batch_model_predict(im_dir="../datasets/flickr/full_images/", texts=None, conf=0.5, iou=0.4)
-
-    agent.multi_thread_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=1)
+    # agent.multi_thread_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=1)
 
 
 

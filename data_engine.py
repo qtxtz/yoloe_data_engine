@@ -99,10 +99,11 @@ class DataEngine:
     def __init__(self,device="cuda"):
         self.device=device
 
-    def load_yoloe(self, model_path="/root/ultra_louis_work/ultralytics/yoloe-v8l-seg.pt"):
+    def load_yoloe(self):
         from ultralytics import YOLOE
 
-
+        model_path="/root/ultra_louis_work/ultralytics/yoloe-11l-seg.pt"
+        yaml_file="yoloe-11l-seg.yaml"
         if hasattr(self,'model'):
             # clear the existing model
             del self.model
@@ -110,7 +111,7 @@ class DataEngine:
             torch.cuda.empty_cache()
             
 
-        self.model=YOLOE("yoloe-v8l-seg.yaml").load(model_path).to(self.device)
+        self.model=YOLOE(yaml_file).load(model_path).to(self.device)
         print("load model from:", model_path)
 
     def set_classes(self,yaml_config=None,name_list=None, text_embed_pt=None):
@@ -416,12 +417,26 @@ class DataEngine:
 
 
 
-    def visual_and_save2(self, indice,
+    def visual_and_save2(self, indice=None,filename=None,
                           save_path="./visualize2.jpg"):
         """Visualizes a label using ultralytics.engine.results.Results and saves it."""
         
         assert self.data_style in ["grounding","detection"]
         print("Visualizing index:", indice)
+
+        if indice is None :
+            assert filename is not None, "Either indice or filename must be provided"
+            
+            for idx, label in enumerate(self.labels):
+                im_file = label['im_file']
+                # if hasattr(self, 'img_source'):
+                #     im_file = os.path.join(self.img_source, im_file)
+                print(im_file)
+                if os.path.basename(im_file) == filename:
+                    indice = idx
+                    print(f"Found filename {filename} at index {indice}")
+                    break
+            assert indice is not None, f"Filename {filename} not found in labels"
 
         label = self.labels[indice]
         print("label keys:", label.keys())

@@ -43,4 +43,6 @@ if __name__ == "__main__":
                         text_embed_pt=text_embed_pt)
     de.print_data_info()
 
+    de.visual_and_save2(filename="353913.jpg", save_path="./visualized_grounding_example_v2.jpg")
+
 

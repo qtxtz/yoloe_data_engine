@@ -45,3 +45,4 @@ if __name__ == "__main__":
 
     # de.visual_and_save2(im_index, save_path="./visualized_grounding_example1.jpg")
 
+    de.visual_and_save2(filename="353913.jpg", save_path="./visualized_grounding_example_v2.jpg")
