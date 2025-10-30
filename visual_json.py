@@ -109,53 +109,71 @@ def sample_to_results(sample: Sample, image_root: Path | str | None = None) -> L
     img_path = _resolve_image_path(sample, image_root=image_root)
     orig_img = np.array(Image.open(img_path).convert("RGB"))
 
-    boxes_data: List[List[float]] = []
-    names: List[str] = []
-    name_to_idx: Dict[str, int] = {}
-
+    text_instances={}
     for inst in sample.instances:
-        bbox_array = np.array(inst.bbox, dtype=np.float32).reshape(-1, 4)
-        if bbox_array.size == 0:
-            continue
+        if inst.text[0] not in text_instances.keys():
+            text_instances[inst.text[0]]=[]
+        text_instances[inst.text[0]].append(inst)
 
-        label = inst.text[0] if inst.text else "unknown"
-        if label not in name_to_idx:
-            name_to_idx[label] = len(names)
-            names.append(label)
-        cls_idx = float(name_to_idx[label])
+    text_result = {}
 
-        conf_value = float(inst.conf[0]) if inst.conf else 0.0
+    for text, instances in text_instances.items():
 
-        for bbox in bbox_array:
-            boxes_data.append([
-                float(bbox[0]),
-                float(bbox[1]),
-                float(bbox[2]),
-                float(bbox[3]),
-                conf_value,
-                cls_idx,
-            ])
+        boxes_data: List[List[float]] = []
+        names: List[str] = []
+        name_to_idx: Dict[str, int] = {}
 
-    boxes_tensor = torch.from_numpy(np.array(boxes_data, dtype=np.float32)) if boxes_data else torch.zeros((0, 6), dtype=torch.float32)
-    names_dict = {idx: name for idx, name in enumerate(names)}
+        for inst in instances:
+            bbox_array = np.array(inst.bbox, dtype=np.float32).reshape(-1, 4)
+            if bbox_array.size == 0:
+                continue
 
-    result = Results(
-        orig_img=orig_img,
-        path=str(img_path),
-        names=names_dict,
-        boxes=boxes_tensor,
-    )
+            label = inst.text[0] if inst.text else "unknown"
+            if label not in name_to_idx:
+                name_to_idx[label] = len(names)
+                names.append(label)
+            cls_idx = float(name_to_idx[label])
 
-    return [result]
+            conf_value = float(inst.conf[0]) if inst.conf else 0.0
 
+            for bbox in bbox_array:
+                boxes_data.append([
+                    float(bbox[0]),
+                    float(bbox[1]),
+                    float(bbox[2]),
+                    float(bbox[3]),
+                    conf_value,
+                    cls_idx,
+                ])
+
+        boxes_tensor = torch.from_numpy(np.array(boxes_data, dtype=np.float32)) if boxes_data else torch.zeros((0, 6), dtype=torch.float32)
+        names_dict = {idx: name for idx, name in enumerate(names)}
+
+        result = Results(
+            orig_img=orig_img,
+            path=str(img_path),
+            names=names_dict,
+            boxes=boxes_tensor,
+        )
+        text_result[text]=result
+    return text_result
 
 def visualize_sample(sample: Sample, dst_vis_img: Path | str, image_root: Path | str | None = None) -> Path:
     """Render sample predictions to an image and save it to ``dst_vis_img``."""
 
-    results = sample_to_results(sample, image_root=image_root)
+    text_result = sample_to_results(sample, image_root=image_root)
     dst_vis_path = Path(dst_vis_img)
     dst_vis_path.parent.mkdir(parents=True, exist_ok=True)
-    results[0].save(str(dst_vis_path))
+
+    for text, results in text_result.items():
+        # split the dst_vis_path into name and ext
+        name = dst_vis_path.stem
+        ext = dst_vis_path.suffix
+        parent = dst_vis_path.parent
+        new_dst_vis_path = parent / f"{name}_{text}{ext}"
+
+        results[0].save(str(new_dst_vis_path))
+
     return dst_vis_path
 
 
