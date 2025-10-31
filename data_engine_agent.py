@@ -12,6 +12,7 @@ import os
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
+import multiprocessing as mp
 from yoloe_data_engine.data_engine import DataEngine
 
 import copy
@@ -48,6 +49,24 @@ def init_worker(images_data, imname_anns_data):
 
 def worker_wrapper(args):
     return DataEngineAgent._load_grounding_data(*args)
+
+
+def _device_predict_worker(args):
+    device, buffer_dir, batches, kwargs = args
+
+    worker_kwargs = dict(kwargs or {})
+    texts = worker_kwargs.pop("texts", None)
+
+    agent = DataEngineAgent(devices=[device], buffer_dir=buffer_dir)
+    agent.load_model_engine()
+    if texts:
+        agent.set_classes(texts=texts)
+
+    engine = agent.models[0]
+
+    for im_files in tqdm(batches, desc=f"Device {device} processing batches"):
+        agent._batch_model_predict_single_process(im_files, engine, **worker_kwargs)
+    return True
 
 class YoloBox:
     def __init__(self, img_shape: list):
@@ -241,21 +260,19 @@ class DataEngineAgent:
             de.load_yoloe()
             self.models.append(de)
 
-    def set_classes(self, texts: list):
+    def set_classes(self, texts: list | None):
+        if not texts:
+            self.texts = texts
+            return
         for model in self.models:
-            model.set_classes(texts)
+            model.set_classes(name_list=texts)
         self.texts = texts
-
-
 
     def _batch_model_predict_single_process(self, im_files, engine: DataEngine, **kwargs):
         dst_dir = os.path.join(self.buffer_dir, "model_predict")
         os.makedirs(dst_dir, exist_ok=True)
         conf = kwargs.get("conf", 0.5)
         iou = kwargs.get("iou", 0.4)
-        texts = kwargs.get("texts", None)
-        if texts is not None:
-            engine.set_classes(texts)
         im_names_wo_ext = [os.path.splitext(os.path.basename(im_file))[0] for im_file in im_files]
         dst_files = [os.path.join(dst_dir, f"{name}.json") for name in im_names_wo_ext]
         indices = [i for i in range(len(im_files)) if not os.path.exists(dst_files[i])]
@@ -271,9 +288,12 @@ class DataEngineAgent:
             sample.load_from_yoloe_result(result)
             sample.save_to_json(dst_files[sample_index])
         return
+
+
+
+
     
     def multi_process_batch_model_predict(self, im_dir, texts=None, conf=0.5, iou=0.4, batch_size=3, max_workers=None):
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         im_files = []
         for file_name in os.listdir(im_dir):
             if file_name.endswith((".jpg", ".jpeg", ".png", ".bmp")):
@@ -283,18 +303,41 @@ class DataEngineAgent:
         print(f"Total images to process: {len(im_files)}")
         batches = [im_files[i:i+batch_size] for i in range(0, len(im_files), batch_size)]
         print(f"Total batches: {len(batches)}, batch size: {batch_size}")
+        if not batches:
+            return []
+
+        if not self.devices:
+            raise ValueError("No devices available for multi-process prediction.")
+
         if max_workers is None:
-            max_workers = min(len(self.models), len(batches))
+            max_workers = len(self.devices)
+        else:
+            max_workers = min(max_workers, len(self.devices))
+
+        worker_devices = self.devices[:max_workers]
+        device_count = len(worker_devices)
+
+        process_args = []
+        for idx, device in enumerate(worker_devices):
+            assigned_batches = batches[idx::device_count]
+            if not assigned_batches:
+                continue
+            kwargs = {'conf': conf, 'iou': iou, 'texts': texts}
+            process_args.append((device, self.buffer_dir, assigned_batches, kwargs))
+
+        if not process_args:
+            print("No batches assigned to workers.")
+            return []
+
         results = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for i, batch in enumerate(batches):
-                model = self.models[i % len(self.models)]
-                kwargs = {'conf': conf, 'iou': iou, 'texts': texts}
-                futures.append(executor.submit(self._batch_model_predict_single_process, batch, model, **kwargs))
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=len(process_args), mp_context=ctx) as executor:
+            futures = [executor.submit(_device_predict_worker, args) for args in process_args]
             for future in tqdm(as_completed(futures), total=len(futures), desc="Model predict ..."):
                 future.result()
         return results
+    
+
     @staticmethod
     def _load_grounding_data(buffer_dir, im_dir, imid, anns, folder_name):
         """Worker invoked in subprocesses to build per-image grounding labels."""
@@ -456,6 +499,8 @@ def read_numpy_and_print(path=None):
     print(data)
 
 if __name__ == "__main__":
+
+
     devices = ["cuda:0","cuda:1","cuda:2","cuda:3"]
 
     # agent = DataEngineAgent(devices=devices, buffer_dir="/root/ultra_louis_work/runs/flickr_engine_buffer")
@@ -469,22 +514,15 @@ if __name__ == "__main__":
     im_dir="../datasets/mixed_grounding/gqa/images"
     # mobileclip_text_embed_pt="/root/ultra_louis_work/datasets/mixed_grounding/gqa/text_embeddings_mobileclip_blt.pt"
     mobileclip_text_embed_pt="/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
+    import torch
+    txt_map= torch.load(mobileclip_text_embed_pt, map_location="cuda:0")
+    name_list=list(txt_map.keys())
 
 
-    # agent.load_model_engine()
-    # text_list=None
-    # for index,model in enumerate(agent.models):
-    #     if text_list is None:       
-    #         text_embed_pt = mobileclip_text_embed_pt
-    #         model.set_classes(text_embed_pt=text_embed_pt)
-    #         text_list=model.names
-    #     else:
-    #         model.set_classes(name_list=text_list)
-
-    # agent.multi_process_batch_model_predict(im_dir=im_dir, texts=None, conf=0.5, iou=0.4,batch_size=3)
+    agent.multi_process_batch_model_predict(im_dir=im_dir, texts=name_list, conf=0.5, iou=0.4,batch_size=2)
 
 
-    agent.multi_process_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=8)
+    # agent.multi_process_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=8)
 
 
 
