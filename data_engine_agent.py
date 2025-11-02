@@ -1,3 +1,5 @@
+from git import List
+from matplotlib.pylab import sample
 import ultralytics,os
 workspace = os.path.dirname(os.path.dirname(os.path.abspath(ultralytics.__file__)))
 os.chdir(workspace)
@@ -40,33 +42,220 @@ def to_serializable(obj):
     return obj
 
 
+######################## Grounding Data Loading Worker ########################
+
+def _load_grounding_data(buffer_dir, im_dir, imid, anns, folder_name):
+    """Worker invoked in subprocesses to build per-image grounding labels."""
+    global IMAGES_CACHE, IMNAME_ANNS_CACHE
+    dst_dir = os.path.join(buffer_dir, folder_name)
+    os.makedirs(dst_dir, exist_ok=True)
+    dst_file = os.path.join(dst_dir, str(imid) + ".json")
+    if os.path.exists(dst_file):
+        return
+    from ultralytics.data.converter import merge_multi_segment
+    from ultralytics.data.dataset import segments2boxes
+    img = IMAGES_CACHE[f"{imid:d}"]
+    h, w, f = img["height"], img["width"], img["file_name"]
+    im_file = Path(im_dir) / f  # Use the passed im_dir
+    bboxes_xyxy = []
+    bboxes = []
+    segments = []
+    cat2id = {}
+    texts = []
+    if IMNAME_ANNS_CACHE is not None:
+        anns_for_img = IMNAME_ANNS_CACHE.get(f, [])
+    else:
+        anns_for_img = []
+    for ann in anns + anns_for_img:
+        if len(bboxes_xyxy) > 0 and YoloBox([int(h), int(w)]).load_from_xyxy(bboxes_xyxy).iou(ann["bbox"]).max() > 0.98:
+            continue
+        if ann["iscrowd"]:
+            continue
+        box = np.array(ann["bbox"], dtype=np.float32)
+        box[:2] += box[2:] / 2
+        box[[0, 2]] /= float(w)
+        box[[1, 3]] /= float(h)
+        if box[2] <= 0 or box[3] <= 0:
+            continue
+        caption = ann["caption"]
+        cat_name = " ".join([caption[t[0]:t[1]] for t in ann["tokens_positive"]]).lower().strip()
+        if not cat_name:
+            continue
+        if cat_name not in cat2id:
+            cat2id[cat_name] = len(cat2id)
+            texts.append([cat_name])
+        cls = cat2id[cat_name]
+        box = [cls] + box.tolist()
+        if box not in bboxes:
+            bboxes.append(box)
+            if ann.get("segmentation") is not None:
+                if len(ann["segmentation"]) == 0:
+                    segments.append(box)
+                    continue
+                elif len(ann["segmentation"]) > 1:
+                    s = merge_multi_segment(ann["segmentation"])
+                    s = (np.concatenate(s, axis=0) / np.array([w, h], dtype=np.float32)).reshape(-1).tolist()
+                else:
+                    s = [j for i in ann["segmentation"] for j in i]
+                    s = (np.array(s, dtype=np.float32).reshape(-1, 2) / np.array([w, h], dtype=np.float32)).reshape(-1).tolist()
+                s = [cls] + s
+                segments.append(s)
+        bboxes_xyxy.append(ann["bbox"])
+    lb = np.array(bboxes, dtype=np.float32) if len(bboxes) else np.zeros((0, 5), dtype=np.float32)
+    if segments:
+        classes = np.array([x[0] for x in segments], dtype=np.float32)
+        segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in segments]
+        lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)
+    lb = np.array(lb, dtype=np.float32)
+    label = {
+        "im_file": str(im_file),
+        "shape": (h, w),
+        "cls": lb[:, 0:1] if lb.size > 0 else [],
+        "bboxes": lb[:, 1:] if lb.size > 0 else [],
+        "segments": [],
+        "normalized": True,
+        "bbox_format": "xywh",
+        "texts": texts,
+    }
+    def serializeLabel(label):
+
+
+        lc = copy.deepcopy(label)
+        lc["im_file"] = str(lc.get("im_file", ""))
+        lc["shape"] = list(lc.get("shape", []))
+        lc["cls"] = to_serializable(lc.get("cls", []))
+        try:
+            cls_arr = np.array(lc["cls"]).reshape(-1)
+            lc["cls"] = [int(x) for x in cls_arr.tolist()]
+        except Exception:
+            pass
+        lc["bboxes"] = to_serializable(lc.get("bboxes", []))
+        lc["segments"] = to_serializable(lc.get("segments", []))
+        lc["texts"] = to_serializable(lc.get("texts", []))
+        lc["normalized"] = bool(lc.get("normalized", True))
+        lc["bbox_format"] = str(lc.get("bbox_format", "xywh"))
+        return lc
+    label_serialized = serializeLabel(label)
+    # tmp_file = str(dst_file) + ".tmp"
+    import json
+    with open(dst_file, "w") as file:
+        json.dump(label_serialized, file, indent=4, ensure_ascii=False)
+    # os.replace(tmp_file, str(dst_file))
+
+
+
+def worker_wrapper(args):
+    return _load_grounding_data(*args)
+
+
 def init_worker(images_data, imname_anns_data):
     """Initializer for worker processes to avoid repeatedly pickling large state."""
     global IMAGES_CACHE, IMNAME_ANNS_CACHE
     IMAGES_CACHE = images_data
     IMNAME_ANNS_CACHE = imname_anns_data
 
+################################## multi-processing model prediction ############################################
 
-def worker_wrapper(args):
-    return DataEngineAgent._load_grounding_data(*args)
+def _batch_model_predict_single_process(self,buffer_dir, im_files, **kwargs):
+    """
+    Batch model predict in a single process. This can be a method of DataEngine.
+    Args:
+        self: DataEngine instance
+        buffer_dir: str, buffer directory to save results
+        im_files: list of str, image file paths
+        kwargs: other keyword arguments for model.predict
+    """
+    assert isinstance(self, DataEngine)
+    engine=self
+    dst_dir = os.path.join(buffer_dir, "model_predict")
+    os.makedirs(dst_dir, exist_ok=True)
+    conf = kwargs.get("conf", 0.5)
+    iou = kwargs.get("iou", 0.4)
+    im_names_wo_ext = [os.path.splitext(os.path.basename(im_file))[0] for im_file in im_files]
+    dst_files = [os.path.join(dst_dir, f"{name}.json") for name in im_names_wo_ext]
+    indices = [i for i in range(len(im_files)) if not os.path.exists(dst_files[i])]
+    if len(indices) == 0:
+        print("All images have been processed, skip.")
+        return
+    process_img_files = [im_files[i] for i in indices]
+    results = list(engine.model.predict(process_img_files, conf=conf, iou=iou, batch=len(process_img_files), stream=True))
+    print(f"Processed {len(process_img_files)} images.")
+    for i, sample_index in enumerate(indices):
+        sample = Sample()
+        result = results[i]
+        sample.load_from_yoloe_result(result)
+        sample.save_to_json(dst_files[sample_index])
+    return
+
 
 
 def _device_predict_worker(args):
+    """
+    Worker function for multi-process model prediction on a specific device.
+    args: tuple containing (device, buffer_dir, batches, kwargs)
+    """
     device, buffer_dir, batches, kwargs = args
 
     worker_kwargs = dict(kwargs or {})
     texts = worker_kwargs.pop("texts", None)
 
-    agent = DataEngineAgent(devices=[device], buffer_dir=buffer_dir)
-    agent.load_model_engine()
-    if texts:
-        agent.set_classes(texts=texts)
-
-    engine = agent.models[0]
+    engine = DataEngine(device=device)
+    engine.load_yoloe()
+    engine.set_classes(name_list=texts)
 
     for im_files in tqdm(batches, desc=f"Device {device} processing batches"):
-        agent._batch_model_predict_single_process(im_files, engine, **worker_kwargs)
+        _batch_model_predict_single_process(engine, buffer_dir, im_files, **worker_kwargs)
     return True
+##############################################################################
+
+
+
+def _merge_prediction_to_sample_label(buffer_dir,sample_json, model_predict_json):
+    """
+        Each sample have a file_name, we merge the model prediction results (model_predict_json) into the sample grounding label.
+        step 1: first check the filename match, if false, raise error.
+        step 2: check the dst file exist, if true, skip.
+        step 3: merge model prediction results into sample grounding label, iou score > 0.5 will be ignored.
+        step 4: save the merged label to buffer_dir/merged_labels/
+    Args:
+        buffer_dir: str, buffer directory to save results
+        sample_json: str, path to sample grounding label json file
+        model_predict_json: str, path to model prediction json file
+    """
+    dst_dir = os.path.join(buffer_dir, "merged_labels")
+    os.makedirs(dst_dir, exist_ok=True)
+    sample_basename = os.path.basename(sample_json)
+    dst_file = os.path.join(dst_dir, sample_basename)
+    if os.path.exists(dst_file):
+        print(f"Merged label {dst_file} already exists, skip.")
+        return
+    with open(model_predict_json, 'r') as f:
+        model_data = json.load(f)
+
+    ground_sample = Sample()
+    ground_sample.load_from_grounding_label(sample_json)
+
+    predict_sample = Sample()
+    predict_sample.load_from_yoloe_result(model_data)
+    for model_inst in predict_sample.instances:
+        model_bbox = YoloBox(sample.shape).load_from_xyxy(model_inst.bbox)
+        ignore_flag = False
+        for sample_inst in sample.instances:
+            sample_bbox = YoloBox(sample.shape).load_from_xyxy(sample_inst.bbox)
+            iou = sample_bbox.iou(model_bbox.xyxy[0])
+            if iou > 0.5:
+                ignore_flag = True
+                break
+        if not ignore_flag:
+            sample.instances.append(model_inst)
+    sample.save_to_json(dst_file)
+    # print(f"Merged label saved to {dst_file}")
+
+
+
+##############################################################################
+
+
 
 class YoloBox:
     def __init__(self, img_shape: list):
@@ -157,6 +346,13 @@ class Instance:
             'vp': to_serializable(self.vpe),
             'other_data': to_serializable(self.other_data)
         }
+    def from_dict(self, data: dict):
+        self.bbox = data.get('bbox')
+        self.text = data.get('text')
+        self.conf = data.get('conf')
+        self.embed = data.get('embed')
+        self.vpe = data.get('vpe')
+        self.other_data = data.get('other_data', {})
 
 class Sample:
     def __init__(self):
@@ -166,7 +362,14 @@ class Sample:
         self.texts = []
         self.other_data = {}
 
-    def load_from_grounding_label(self, grounding_data: dict):
+    def load_from_grounding_label(self, grounding_data):
+        if isinstance(grounding_data, str):
+            assert grounding_data.endswith(".json"), "If grounding_data is str, it should be a json file path."
+            import json
+            with open(grounding_data, 'r') as f:
+                grounding_data = json.load(f)
+
+        assert isinstance(grounding_data, dict), "grounding_data should be a dict"
         self.im_file = grounding_data.get("im_file")
         self.shape = grounding_data.get("shape")
         for text in grounding_data.get("texts"):
@@ -196,34 +399,47 @@ class Sample:
             inst.set_text([self.texts[cls]], [-1])
             self.instances.append(inst)
 
-    def to_grounding_label(self) -> dict:
-        grounding_data = {}
-        grounding_data['im_file'] = self.im_file
-        grounding_data['shape'] = self.shape
-        grounding_data['texts'] = [[text] for text in self.texts]
-        bboxes = []
-        segments = []
-        cls_list = []
-        for inst in self.instances:
-            bboxes.append(inst.bbox)
-            segments.append(inst.segment)
-            text, _ = inst.get_top_text_conf()
-            cls_index = self.texts.index(text)
-            cls_list.append(cls_index)
-        grounding_data['bboxes'] = bboxes
-        grounding_data['segments'] = segments
-        grounding_data['cls'] = cls_list
-        grounding_data['normalized'] = True
-        grounding_data['bbox_format'] = 'xywhn'
-        return grounding_data
-
+    # def to_grounding_label(self) -> dict:
+    #     grounding_data = {}
+    #     grounding_data['im_file'] = self.im_file
+    #     grounding_data['shape'] = self.shape
+    #     grounding_data['texts'] = [[text] for text in self.texts]
+    #     bboxes = []
+    #     segments = []
+    #     cls_list = []
+    #     for inst in self.instances:
+    #         bboxes.append(inst.bbox)
+    #         segments.append(inst.segment)
+    #         text, _ = inst.get_top_text_conf()
+    #         cls_index = self.texts.index(text)
+    #         cls_list.append(cls_index)
+    #     grounding_data['bboxes'] = bboxes
+    #     grounding_data['segments'] = segments
+    #     grounding_data['cls'] = cls_list
+    #     grounding_data['normalized'] = True
+    #     grounding_data['bbox_format'] = 'xywhn'
+    #     return grounding_data
 
     def load_from_yoloe_result(self, yoloe_result):
-        self.instances = []
-        self.im_file = yoloe_result.path
-        self.shape = (yoloe_result.orig_shape[0], yoloe_result.orig_shape[1])
-        boxes = yoloe_result.boxes
-        names = yoloe_result.names
+        
+        if isinstance(yoloe_result, str):
+            assert yoloe_result.endswith(".json"), "If yoloe_result is str, it should be a json file path."
+            import json
+            with open(yoloe_result, 'r') as f:
+                yoloe_result = json.load(f)
+            assert isinstance(yoloe_result, dict), "yoloe_result should be a dict"
+            
+            self.instances = []
+            self.im_file = yoloe_result.get("im_file")
+            self.shape = (yoloe_result.get("orig_shape", [0, 0])[0], yoloe_result.get("orig_shape", [0, 0])[1])
+            boxes = yoloe_result.get("boxes", [])
+            names = yoloe_result.get("names", [])
+        else:
+            self.instances = []
+            self.im_file = yoloe_result.path
+            self.shape = (yoloe_result.orig_shape[0], yoloe_result.orig_shape[1])
+            boxes = yoloe_result.boxes
+            names = yoloe_result.names
         for box in boxes:
             bbox_xyxy = box.xyxy.cpu().numpy()
             conf = box.conf.cpu().numpy()
@@ -239,12 +455,25 @@ class Sample:
             'other_data': to_serializable(self.other_data)
         }
     
+
+
     def save_to_json(self, json_path):
         import json
         with open(json_path, 'w') as f:
             json.dump(self.to_dict(), f, indent=4)
         # print(f"Saved sample to {json_path}")
 
+    def load_from_json(self,json_path):
+        import json
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+        self.im_file = data.get('im_file')
+        self.instances = []
+        for inst_data in data.get('instances', []):
+            inst = Instance()
+            inst.from_dict(inst_data)
+            self.instances.append(inst)
+        self.other_data = data.get('other_data', {})
 
 class DataEngineAgent:
     def __init__(self, devices=["cuda:0"], buffer_dir="/root/ultra_louis_work/engine_buffer"):
@@ -267,27 +496,6 @@ class DataEngineAgent:
         for model in self.models:
             model.set_classes(name_list=texts)
         self.texts = texts
-
-    def _batch_model_predict_single_process(self, im_files, engine: DataEngine, **kwargs):
-        dst_dir = os.path.join(self.buffer_dir, "model_predict")
-        os.makedirs(dst_dir, exist_ok=True)
-        conf = kwargs.get("conf", 0.5)
-        iou = kwargs.get("iou", 0.4)
-        im_names_wo_ext = [os.path.splitext(os.path.basename(im_file))[0] for im_file in im_files]
-        dst_files = [os.path.join(dst_dir, f"{name}.json") for name in im_names_wo_ext]
-        indices = [i for i in range(len(im_files)) if not os.path.exists(dst_files[i])]
-        if len(indices) == 0:
-            print("All images have been processed, skip.")
-            return
-        process_img_files = [im_files[i] for i in indices]
-        results = list(engine.model.predict(process_img_files, conf=conf, iou=iou, batch=len(process_img_files), stream=True))
-        print(f"Processed {len(process_img_files)} images.")
-        for i, sample_index in enumerate(indices):
-            sample = Sample()
-            result = results[i]
-            sample.load_from_yoloe_result(result)
-            sample.save_to_json(dst_files[sample_index])
-        return
 
 
 
@@ -338,104 +546,7 @@ class DataEngineAgent:
         return results
     
 
-    @staticmethod
-    def _load_grounding_data(buffer_dir, im_dir, imid, anns, folder_name):
-        """Worker invoked in subprocesses to build per-image grounding labels."""
-        global IMAGES_CACHE, IMNAME_ANNS_CACHE
-        dst_dir = os.path.join(buffer_dir, folder_name)
-        os.makedirs(dst_dir, exist_ok=True)
-        dst_file = os.path.join(dst_dir, str(imid) + ".json")
-        if os.path.exists(dst_file):
-            return
-        from ultralytics.data.converter import merge_multi_segment
-        from ultralytics.data.dataset import segments2boxes
-        img = IMAGES_CACHE[f"{imid:d}"]
-        h, w, f = img["height"], img["width"], img["file_name"]
-        im_file = Path(im_dir) / f  # Use the passed im_dir
-        bboxes_xyxy = []
-        bboxes = []
-        segments = []
-        cat2id = {}
-        texts = []
-        if IMNAME_ANNS_CACHE is not None:
-            anns_for_img = IMNAME_ANNS_CACHE.get(f, [])
-        else:
-            anns_for_img = []
-        for ann in anns + anns_for_img:
-            if len(bboxes_xyxy) > 0 and YoloBox([int(h), int(w)]).load_from_xyxy(bboxes_xyxy).iou(ann["bbox"]).max() > 0.98:
-                continue
-            if ann["iscrowd"]:
-                continue
-            box = np.array(ann["bbox"], dtype=np.float32)
-            box[:2] += box[2:] / 2
-            box[[0, 2]] /= float(w)
-            box[[1, 3]] /= float(h)
-            if box[2] <= 0 or box[3] <= 0:
-                continue
-            caption = ann["caption"]
-            cat_name = " ".join([caption[t[0]:t[1]] for t in ann["tokens_positive"]]).lower().strip()
-            if not cat_name:
-                continue
-            if cat_name not in cat2id:
-                cat2id[cat_name] = len(cat2id)
-                texts.append([cat_name])
-            cls = cat2id[cat_name]
-            box = [cls] + box.tolist()
-            if box not in bboxes:
-                bboxes.append(box)
-                if ann.get("segmentation") is not None:
-                    if len(ann["segmentation"]) == 0:
-                        segments.append(box)
-                        continue
-                    elif len(ann["segmentation"]) > 1:
-                        s = merge_multi_segment(ann["segmentation"])
-                        s = (np.concatenate(s, axis=0) / np.array([w, h], dtype=np.float32)).reshape(-1).tolist()
-                    else:
-                        s = [j for i in ann["segmentation"] for j in i]
-                        s = (np.array(s, dtype=np.float32).reshape(-1, 2) / np.array([w, h], dtype=np.float32)).reshape(-1).tolist()
-                    s = [cls] + s
-                    segments.append(s)
-            bboxes_xyxy.append(ann["bbox"])
-        lb = np.array(bboxes, dtype=np.float32) if len(bboxes) else np.zeros((0, 5), dtype=np.float32)
-        if segments:
-            classes = np.array([x[0] for x in segments], dtype=np.float32)
-            segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in segments]
-            lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)
-        lb = np.array(lb, dtype=np.float32)
-        label = {
-            "im_file": str(im_file),
-            "shape": (h, w),
-            "cls": lb[:, 0:1] if lb.size > 0 else [],
-            "bboxes": lb[:, 1:] if lb.size > 0 else [],
-            "segments": [],
-            "normalized": True,
-            "bbox_format": "xywh",
-            "texts": texts,
-        }
-        def serializeLabel(label):
 
-
-            lc = copy.deepcopy(label)
-            lc["im_file"] = str(lc.get("im_file", ""))
-            lc["shape"] = list(lc.get("shape", []))
-            lc["cls"] = to_serializable(lc.get("cls", []))
-            try:
-                cls_arr = np.array(lc["cls"]).reshape(-1)
-                lc["cls"] = [int(x) for x in cls_arr.tolist()]
-            except Exception:
-                pass
-            lc["bboxes"] = to_serializable(lc.get("bboxes", []))
-            lc["segments"] = to_serializable(lc.get("segments", []))
-            lc["texts"] = to_serializable(lc.get("texts", []))
-            lc["normalized"] = bool(lc.get("normalized", True))
-            lc["bbox_format"] = str(lc.get("bbox_format", "xywh"))
-            return lc
-        label_serialized = serializeLabel(label)
-        # tmp_file = str(dst_file) + ".tmp"
-        import json
-        with open(dst_file, "w") as file:
-            json.dump(label_serialized, file, indent=4, ensure_ascii=False)
-        # os.replace(tmp_file, str(dst_file))
         # print(f"Saved sample to {dst_file}")
 
     def multi_process_load_grounding_data(self, im_dir, json_file, merge_within_one_image, max_workers=8):
@@ -509,18 +620,38 @@ if __name__ == "__main__":
     # mobileclip_text_embed_pt="/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
 
 
-    agent = DataEngineAgent(devices=devices, buffer_dir="/root/ultra_louis_work/runs/mixed_engine_buffer")
-    json_file= "../datasets/mixed_grounding/annotations/final_mixed_train_no_coco_segm.json"
-    im_dir="../datasets/mixed_grounding/gqa/images"
-    # mobileclip_text_embed_pt="/root/ultra_louis_work/datasets/mixed_grounding/gqa/text_embeddings_mobileclip_blt.pt"
-    mobileclip_text_embed_pt="/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
-    import torch
-    txt_map= torch.load(mobileclip_text_embed_pt, map_location="cuda:0")
-    name_list=list(txt_map.keys())
+    DATA="mixed_grounding"  # "mixed_grounding"
+
+    if DATA=="flickr":
 
 
-    agent.multi_process_batch_model_predict(im_dir=im_dir, texts=name_list, conf=0.5, iou=0.4,batch_size=2)
+        agent = DataEngineAgent(devices=devices, buffer_dir="/root/ultra_louis_work/runs/flickr_engine_buffer")
+        json_file = "/root/ultra_louis_work/datasets/flickr/annotations/final_flickr_separateGT_train_segm.json"
+        im_dir = "../datasets/flickr/full_images/"
+        # mobileclip_text_embed_pt = "/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
+        mobileclip_text_embed_pt=r"/root/ultra_louis_work/datasets/mixed_grounding/gqa/text_embeddings_mobileclip_blt.pt"
+    
+        import torch
+        txt_map = torch.load(mobileclip_text_embed_pt, map_location="cuda:0")
+        name_list = list   (txt_map.keys())[:50000]
+        # agent.multi_process_batch_model_predict(im_dir=im_dir, texts=name_list, conf=0.5, iou=0.4, batch_size=2)
+        # agent.multi_process_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=8)
 
+    elif DATA=="mixed_grounding":
+
+
+        agent = DataEngineAgent(devices=devices, buffer_dir="/root/ultra_louis_work/runs/mixed_engine_buffer")
+        json_file= "../datasets/mixed_grounding/annotations/final_mixed_train_no_coco_segm.json"
+        im_dir="../datasets/mixed_grounding/gqa/images"
+        mobileclip_text_embed_pt = "/root/ultra_louis_work/datasets/flickr/text_embeddings_mobileclip_blt.pt"
+    
+        # import torch
+        # txt_map= torch.load(mobileclip_text_embed_pt, map_location="cuda:0")
+        # name_list=list(txt_map.keys())[:50000]
+        # agent.multi_process_batch_model_predict(im_dir=im_dir, texts=name_list, conf=0.5, iou=0.4,batch_size=2)
+
+
+        agent.multi_process_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=8)
 
     # agent.multi_process_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=8)
 
