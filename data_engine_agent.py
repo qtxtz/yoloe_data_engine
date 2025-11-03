@@ -216,42 +216,74 @@ def _merge_prediction_to_sample_label(buffer_dir,sample_json, model_predict_json
         step 1: first check the filename match, if false, raise error.
         step 2: check the dst file exist, if true, skip.
         step 3: merge model prediction results into sample grounding label, iou score > 0.5 will be ignored.
-        step 4: save the merged label to buffer_dir/merged_labels/
+        step 4: save the merged label to buffer_dir/merge_prediction/
     Args:
         buffer_dir: str, buffer directory to save results
         sample_json: str, path to sample grounding label json file
         model_predict_json: str, path to model prediction json file
     """
-    dst_dir = os.path.join(buffer_dir, "merged_labels")
+    dst_dir = os.path.join(buffer_dir, "merge_prediction")
     os.makedirs(dst_dir, exist_ok=True)
     sample_basename = os.path.basename(sample_json)
     dst_file = os.path.join(dst_dir, sample_basename)
     if os.path.exists(dst_file):
-        print(f"Merged label {dst_file} already exists, skip.")
-        return
-    with open(model_predict_json, 'r') as f:
-        model_data = json.load(f)
+        print(f"[merge] Skip existing: {dst_file}")
+        return True
 
     ground_sample = Sample()
     ground_sample.load_from_grounding_label(sample_json)
 
     predict_sample = Sample()
-    predict_sample.load_from_yoloe_result(model_data)
+    predict_sample.load_from_json(model_predict_json)
+
     for model_inst in predict_sample.instances:
-        model_bbox = YoloBox(sample.shape).load_from_xyxy(model_inst.bbox)
+        # Defensive: skip invalid model instances
+        if getattr(model_inst, 'bbox', None) is None:
+            print(f"[merge][WARN] skipping model instance with empty bbox in '{sample_json}'")
+            continue
+        try:
+            model_bbox = YoloBox(ground_sample.shape).load_from_xyxy(model_inst.bbox)
+        except Exception as e:
+            print(f"[merge][WARN] failed to parse model bbox for '{sample_json}': {e}")
+            continue
         ignore_flag = False
-        for sample_inst in sample.instances:
-            sample_bbox = YoloBox(sample.shape).load_from_xyxy(sample_inst.bbox)
+        for sample_inst in ground_sample.instances:
+            sample_bbox = YoloBox(ground_sample.shape).load_from_xyxy(sample_inst.bbox)
             iou = sample_bbox.iou(model_bbox.xyxy[0])
             if iou > 0.5:
                 ignore_flag = True
                 break
         if not ignore_flag:
-            sample.instances.append(model_inst)
-    sample.save_to_json(dst_file)
+            ground_sample.instances.append(model_inst)
+
+    ground_sample.save_to_json(dst_file)
+    # print(f"[merge] Saved: {dst_file}")
+    return True
     # print(f"Merged label saved to {dst_file}")
 
+def merge_prediction_worker(args):
+    # Support both (idx, buffer_dir, sample_json, model_predict_json) and (buffer_dir, sample_json, model_predict_json)
+    try:
+        if len(args) == 4:
+            idx, buffer_dir, sample_json, model_predict_json = args
+        else:
+            buffer_dir, sample_json, model_predict_json = args
+            idx = -1
+    except Exception:
+        # Fallback if args isn't a tuple/list
+        buffer_dir, sample_json, model_predict_json = args
+        idx = -1
 
+    if idx < 5 or (idx >= 0 and idx % 5000 == 0):
+        print(f"[worker] idx={idx} merging sample='{os.path.basename(sample_json)}'")
+    try:
+        return _merge_prediction_to_sample_label(buffer_dir, sample_json, model_predict_json)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[worker][ERROR] idx={idx} file='{sample_json}': {repr(e)}\n{tb}")
+        return False
+    
 
 ##############################################################################
 
@@ -260,8 +292,20 @@ def _merge_prediction_to_sample_label(buffer_dir,sample_json, model_predict_json
 class YoloBox:
     def __init__(self, img_shape: list):
         assert len(img_shape) == 2, "img_sz should be (height,width)"
-        self.img_h = img_shape[0]
-        self.img_w = img_shape[1]
+        # Coerce to numeric floats to handle numpy scalars or strings
+        try:
+            self.img_h = float(img_shape[0])
+            self.img_w = float(img_shape[1])
+        except Exception:
+            # Try a second attempt via numpy
+            try:
+                arr = np.array(img_shape).astype(np.float32).reshape(-1)
+                self.img_h = float(arr[0])
+                self.img_w = float(arr[1])
+            except Exception as e:
+                raise ValueError(f"Invalid image shape provided to YoloBox: {img_shape}") from e
+        if self.img_h <= 0 or self.img_w <= 0:
+            raise ValueError(f"Image width/height must be positive, got img_h={self.img_h}, img_w={self.img_w}")
         self.xyxy = None
         self.xywhn = None  # normalized xywh
 
@@ -277,15 +321,50 @@ class YoloBox:
         return self
 
     def load_from_xyxy(self, bboxes_xyxy):
-        if isinstance(bboxes_xyxy, list):
-            bboxes_xyxy = np.array(bboxes_xyxy)
-        bboxes_xyxy = np.array(bboxes_xyxy, dtype=np.float32)
-        bboxes_xywhn = np.zeros_like(bboxes_xyxy)
+        # Robustly coerce input to a numeric numpy array of shape (N,4)
+        def _to_float_array(x):
+            # Accept lists, tuples, numpy arrays, nested shapes
+            if isinstance(x, (list, tuple)):
+                try:
+                    arr = np.array(x, dtype=np.float32)
+                except Exception:
+                    # Try element-wise conversion
+                    flat = []
+                    for el in x:
+                        if isinstance(el, (list, tuple, np.ndarray)):
+                            flat.append([float(v) for v in el])
+                        else:
+                            flat.append(float(el))
+                    arr = np.array(flat, dtype=np.float32)
+            elif isinstance(x, np.ndarray):
+                arr = x.astype(np.float32, copy=False)
+            else:
+                # attempt generic conversion
+                arr = np.array(x, dtype=np.float32)
+
+            # Normalize shape: if 1D length==4 -> (1,4)
+            if arr.ndim == 1 and arr.size == 4:
+                arr = arr.reshape(1, 4)
+            # If last dimension is >4 (e.g., [cls,x,y,w,h]), try to take first 4 or last 4
+            if arr.ndim == 2 and arr.shape[1] > 4:
+                # prefer last 4 entries (common in some formats)
+                arr = arr[:, -4:]
+            if arr.ndim != 2 or arr.shape[1] != 4:
+                raise ValueError(f"Invalid bbox shape after conversion: {arr.shape}, original={type(x)}")
+            return arr
+
+        try:
+            bboxes_xyxy = _to_float_array(bboxes_xyxy)
+        except Exception as e:
+            # Re-raise with more context for upstream logging
+            raise TypeError(f"Failed to convert bboxes to float array: {e}") from e
+
+        bboxes_xywhn = np.zeros_like(bboxes_xyxy, dtype=np.float32)
         if bboxes_xyxy.shape[0] > 0:
-            bboxes_xywhn[:, 0] = ((bboxes_xyxy[:, 0] + bboxes_xyxy[:, 2]) / 2) / self.img_w
-            bboxes_xywhn[:, 1] = ((bboxes_xyxy[:, 1] + bboxes_xyxy[:, 3]) / 2) / self.img_h
-            bboxes_xywhn[:, 2] = (bboxes_xyxy[:, 2] - bboxes_xyxy[:, 0]) / self.img_w
-            bboxes_xywhn[:, 3] = (bboxes_xyxy[:, 3] - bboxes_xyxy[:, 1]) / self.img_h
+            bboxes_xywhn[:, 0] = ((bboxes_xyxy[:, 0] + bboxes_xyxy[:, 2]) / 2.0) / float(self.img_w)
+            bboxes_xywhn[:, 1] = ((bboxes_xyxy[:, 1] + bboxes_xyxy[:, 3]) / 2.0) / float(self.img_h)
+            bboxes_xywhn[:, 2] = (bboxes_xyxy[:, 2] - bboxes_xyxy[:, 0]) / float(self.img_w)
+            bboxes_xywhn[:, 3] = (bboxes_xyxy[:, 3] - bboxes_xyxy[:, 1]) / float(self.img_h)
         self.xyxy = bboxes_xyxy
         self.xywhn = bboxes_xywhn
         return self
@@ -385,13 +464,19 @@ class Sample:
         self.other_data["bbox_format"] = bbox_format
         self.other_data["normalized"] = normalized
         assert normalized is True
-        assert bbox_format == "xywhn"
+        # assert bbox_format == "xywhn"
         for cls, box, segment in zip(grounding_data.get("cls", []), grounding_data.get("bboxes", []), grounding_data.get("segments", [])):
-            bbox = YoloBox(self.shape).load_from_xywhn_normalized(np.array([box])).xyxy[0]
-            assert bbox.shape == (4,)
-            assert segment.shape[0] == 2
-            inst = Instance(bbox=box)
-            inst.set_segment(segment)
+            # Convert normalized xywh to xyxy for internal consistency
+            bbox_xyxy = YoloBox(self.shape).load_from_xywhn_normalized(np.array([box], dtype=np.float32)).xyxy[0]
+            # Create instance with xyxy bbox
+            inst = Instance(bbox=bbox_xyxy.tolist())
+            # Attach segment only if well-formed (N,2)
+            try:
+                seg_arr = np.array(segment, dtype=np.float32)
+                if seg_arr.ndim == 2 and seg_arr.shape[1] == 2:
+                    inst.set_segment(seg_arr)
+            except Exception:
+                pass
             cls = int(cls)
             assert cls < len(self.texts)
             text = self.texts[cls]
@@ -592,6 +677,69 @@ class DataEngineAgent:
 
         print("Finished loading grounding data.")
 
+    def multi_process_merge_prediction(self,json_dir,predict_json_dir,max_workers=8):
+        
+        json_files= []
+        predict_json_files = []
+        for sample_file_name in os.listdir(json_dir):
+            if sample_file_name.endswith(".json"):
+                json_path= os.path.join(json_dir, sample_file_name)
+                json_files.append(json_path)
+
+                # read json_path and get im_file name
+                with open(json_path, 'r') as f:
+                    sample_data = json.load(f)
+                im_file = sample_data.get("im_file")
+                im_name = os.path.splitext(os.path.basename(im_file))[0]
+                predict_json_path= os.path.join(predict_json_dir, f"{im_name}.json")
+                if os.path.exists(predict_json_path):
+                    predict_json_files.append(predict_json_path)
+                else:
+                    predict_json_files.append(None)
+        print(f"Total samples to merge: {len(json_files)}")
+        # check number of json_files with none predict_json_files
+        valid_json_files = []
+        valid_predict_json_files = []
+        for json_file, predict_json_file in zip(json_files, predict_json_files):
+            if predict_json_file is not None:
+                valid_json_files.append(json_file)
+                valid_predict_json_files.append(predict_json_file)
+        json_files = valid_json_files
+        predict_json_files = valid_predict_json_files
+
+        print(f"Total samples with predictions: {len(json_files)}")
+        worker_count = max_workers if max_workers is not None else (os.cpu_count() or 1)
+        print(f"[merge] Using worker_count={worker_count}")
+
+        process_args = []
+        for i in range(len(json_files)):
+            # include index for debug prints inside workers
+            process_args.append((i, self.buffer_dir, json_files[i], predict_json_files[i]))
+
+        # Show a few samples for debugging
+        preview_n = min(3, len(process_args))
+        for k in range(preview_n):
+            _, _, s, p = process_args[k]
+            print(f"[merge] Task preview[{k}]: sample='{s}', predict='{p}'")
+
+        # Use 'spawn' to avoid fork-related issues and set a chunksize for throughput
+        ctx = mp.get_context("spawn")
+        chunksize = max(1, min(500, len(process_args) // (worker_count * 4) if worker_count > 0 else 1))
+        print(f"[merge] Submitting {len(process_args)} tasks with chunksize={chunksize}")
+
+        with ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as executor:
+            iterable = executor.map(merge_prediction_worker, process_args, chunksize=chunksize)
+            ok = 0
+            total = 0
+            for result in tqdm(iterable, total=len(process_args), desc="Merging predictions"):
+                total += 1
+                if result:
+                    ok += 1
+                if total % 10000 == 0:
+                    print(f"[merge] Progress: {ok}/{total} succeeded")
+        print(f"[merge] Done: {ok}/{total} succeeded")
+                
+
     def _merge_predict(self):
         pass
 
@@ -636,6 +784,9 @@ if __name__ == "__main__":
         name_list = list   (txt_map.keys())[:50000]
         # agent.multi_process_batch_model_predict(im_dir=im_dir, texts=name_list, conf=0.5, iou=0.4, batch_size=2)
         # agent.multi_process_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=8)
+        agent.multi_process_merge_prediction(json_dir="/root/ultra_louis_work/runs/flickr_engine_buffer/grounding_data_merged",
+                                            predict_json_dir="/root/ultra_louis_work/runs/flickr_engine_buffer/model_predict",
+                                            max_workers=8)
 
     elif DATA=="mixed_grounding":
 
@@ -651,7 +802,10 @@ if __name__ == "__main__":
         # agent.multi_process_batch_model_predict(im_dir=im_dir, texts=name_list, conf=0.5, iou=0.4,batch_size=2)
 
 
-        agent.multi_process_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=8)
+        # agent.multi_process_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=8)
+        agent.multi_process_merge_prediction(json_dir="/root/ultra_louis_work/runs/mixed_engine_buffer/grounding_data_merged",
+                                            predict_json_dir="/root/ultra_louis_work/runs/mixed_engine_buffer/model_predict",
+                                            max_workers=8)
 
     # agent.multi_process_load_grounding_data(json_file=json_file, im_dir=im_dir, merge_within_one_image=True, max_workers=8)
 
